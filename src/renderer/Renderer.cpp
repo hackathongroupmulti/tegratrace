@@ -115,13 +115,7 @@ void Renderer::createUniformBuffers() {
 }
 
 void Renderer::createDescriptorSets() {
-    // Need to get the DSLayout from the pipeline - use pipeline layout query
-    // We expose it via a VkDescriptorSetLayout stored in the pipeline
-    // For now get it via pipeline's layout (we store it indirectly)
-    // Workaround: allocate from pool using the layout baked into the pipeline
-
-    // The descriptor set layout was created in Pipeline::Pipeline and bound to m_layout.
-    // We need the raw VkDescriptorSetLayout. To avoid circular deps, we re-create a compatible layout here.
+    // Re-create a compatible layout here to allocate descriptor sets
     VkDescriptorSetLayoutBinding binding{};
     binding.binding        = 0;
     binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -162,30 +156,30 @@ void Renderer::createDescriptorSets() {
 }
 
 void Renderer::updateUniformBuffer(uint32_t frame, uint32_t frameNumber) {
-    if (m_hasUBOOverride) {
-        m_lastUBO = m_uboOverride;
-        m_uniformBuffers[frame]->writeHostVisible(&m_lastUBO, sizeof(m_lastUBO));
-        return;
-    }
     UniformBufferObject ubo{};
-    float angle = frameNumber * 0.016f;  // ~1 full rotation per 400 frames
 
-    auto model = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.3f, 1.0f, 0.2f));
-    model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -2.5f)) * model;
+    if (m_replayData) {
+        // Use view/proj from replay data
+        memcpy(ubo.view, m_replayData->view, sizeof(ubo.view));
+        memcpy(ubo.proj, m_replayData->proj, sizeof(ubo.proj));
+    } else {
+        auto view = glm::mat4(1.0f);
 
-    auto view = glm::mat4(1.0f);
+        auto ext    = m_swapchain.extent();
+        float aspect = static_cast<float>(ext.width) / static_cast<float>(ext.height);
+        float fov = (m_scene == 1) ? 60.0f : 45.0f;
+        auto proj   = glm::perspective(glm::radians(fov), aspect, 0.1f, 100.0f);
+        proj[1][1] *= -1.0f;  // Vulkan Y-flip
 
-    auto ext    = m_swapchain.extent();
-    float aspect = static_cast<float>(ext.width) / static_cast<float>(ext.height);
-    auto proj   = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
-    proj[1][1] *= -1.0f;  // Vulkan Y-flip
+        memcpy(ubo.view, glm::value_ptr(view), sizeof(ubo.view));
+        memcpy(ubo.proj, glm::value_ptr(proj), sizeof(ubo.proj));
+    }
 
-    memcpy(ubo.model, glm::value_ptr(model), sizeof(ubo.model));
-    memcpy(ubo.view,  glm::value_ptr(view),  sizeof(ubo.view));
-    memcpy(ubo.proj,  glm::value_ptr(proj),  sizeof(ubo.proj));
+    memcpy(m_currentView, ubo.view, sizeof(m_currentView));
+    memcpy(m_currentProj, ubo.proj, sizeof(m_currentProj));
 
-    m_lastUBO = ubo;
     m_uniformBuffers[frame]->writeHostVisible(&ubo, sizeof(ubo));
+    (void)frameNumber;
 }
 
 VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t frameNumber,
@@ -219,10 +213,8 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     rbi.clearValueCount = static_cast<uint32_t>(clearValues.size());
     rbi.pClearValues    = clearValues.data();
 
-    Pipeline& activePipeline = m_activePipeline ? *m_activePipeline : m_pipeline;
-
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline.handle());
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.handle());
 
     VkViewport vp{ 0, 0, static_cast<float>(ext.width), static_cast<float>(ext.height), 0, 1 };
     VkRect2D   sc{ {0, 0}, ext };
@@ -234,30 +226,72 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &vbOffset);
     vkCmdBindIndexBuffer(cmd, m_indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT16);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                             activePipeline.layout(), 0, 1,
+                             m_pipeline.layout(), 0, 1,
                              &m_descriptorSets[frameIdx % Swapchain::kMaxFramesInFlight],
                              0, nullptr);
 
-    vkCmdDrawIndexed(cmd, m_indexCount, m_instanceCount, 0, 0, 0);
-    stats.drawCalls++;
-    stats.indexCount  += m_indexCount * m_instanceCount;
-    stats.vertexCount += static_cast<uint32_t>(kCubeVerts.size()) * m_instanceCount;
+    // Build list of per-object model matrices
+    std::vector<glm::mat4> models;
+    float angle = frameNumber * 0.016f;  // ~1 full rotation per 400 frames
 
-    if (m_captureCallback) {
-        DrawCallRecord rec{};
-        rec.vertexCount    = static_cast<uint32_t>(kCubeVerts.size());
-        rec.instanceCount  = m_instanceCount;
-        rec.indexCount     = m_indexCount * m_instanceCount;
-        rec.firstVertex    = 0;
-        rec.pipeline       = activePipeline.name();
-        rec.vertShader     = activePipeline.vertSpvPath();
-        rec.fragShader     = activePipeline.fragSpvPath();
-        rec.viewportW      = static_cast<float>(ext.width);
-        rec.viewportH      = static_cast<float>(ext.height);
-        memcpy(rec.model, m_lastUBO.model, sizeof(rec.model));
-        memcpy(rec.view,  m_lastUBO.view,  sizeof(rec.view));
-        memcpy(rec.proj,  m_lastUBO.proj,  sizeof(rec.proj));
-        m_captureCallback(frameNumber, {rec});
+    if (m_replayData) {
+        for (auto& rd : m_replayData->draws) {
+            glm::mat4 m;
+            memcpy(glm::value_ptr(m), rd.model, 64);
+            models.push_back(m);
+        }
+    } else if (m_scene == 0) {
+        // Single cube
+        auto model = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.3f, 1.0f, 0.2f));
+        model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -2.5f)) * model;
+        models.push_back(model);
+    } else {
+        // Scene 1: 5x5 grid of 25 cubes
+        for (int row = 0; row < 5; ++row) {
+            for (int col = 0; col < 5; ++col) {
+                float x = (col - 2) * 1.5f;
+                float y = (row - 2) * 1.5f;
+                float z = -8.0f;
+                auto model = glm::translate(glm::mat4(1.0f), glm::vec3(x, y, z));
+                model = model * glm::rotate(glm::mat4(1.0f),
+                    angle + row * 0.3f + col * 0.2f, glm::vec3(0.3f, 1.0f, 0.2f));
+                models.push_back(model);
+            }
+        }
+    }
+
+    std::vector<DrawCallRecord> records;
+
+    for (auto& model : models) {
+        // Push model matrix via push constants
+        vkCmdPushConstants(cmd, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT,
+                           0, 64, glm::value_ptr(model));
+        vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+
+        stats.drawCalls++;
+        stats.indexCount  += m_indexCount;
+        stats.vertexCount += static_cast<uint32_t>(kCubeVerts.size());
+
+        if (m_captureCallback) {
+            DrawCallRecord rec{};
+            rec.vertexCount    = static_cast<uint32_t>(kCubeVerts.size());
+            rec.instanceCount  = 1;
+            rec.indexCount     = m_indexCount;
+            rec.firstVertex    = 0;
+            rec.pipeline       = m_pipeline.name();
+            rec.vertShader     = m_pipeline.vertSpvPath();
+            rec.fragShader     = m_pipeline.fragSpvPath();
+            rec.viewportW      = static_cast<float>(ext.width);
+            rec.viewportH      = static_cast<float>(ext.height);
+            memcpy(rec.model, glm::value_ptr(model), sizeof(rec.model));
+            memcpy(rec.view,  m_currentView, sizeof(rec.view));
+            memcpy(rec.proj,  m_currentProj, sizeof(rec.proj));
+            records.push_back(rec);
+        }
+    }
+
+    if (m_captureCallback && !records.empty()) {
+        m_captureCallback(frameNumber, records);
     }
 
     if (m_frameCallback)

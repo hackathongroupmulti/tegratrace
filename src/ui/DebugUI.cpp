@@ -151,6 +151,16 @@ void DebugUI::buildPanels(const UIFrameData& data) {
             ImGui::SetScrollHereY(1.0f);
     }
     ImGui::End();
+
+    // --- Scene Control ---
+    ImGui::SetNextWindowPos({10, 645}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 75}, ImGuiCond_Once);
+    ImGui::Begin("Scene Control");
+    ImGui::Text("Active: Scene %d", m_activeScene);
+    if (ImGui::Button("Single Cube")) { m_activeScene = 0; if (m_sceneCallback) m_sceneCallback(0); }
+    ImGui::SameLine();
+    if (ImGui::Button("5x5 Grid")) { m_activeScene = 1; if (m_sceneCallback) m_sceneCallback(1); }
+    ImGui::End();
 }
 
 } // namespace tgt

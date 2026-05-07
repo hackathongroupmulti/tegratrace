@@ -30,6 +30,12 @@ struct FrameGPUReport {
     PipelineStats pipelineStats;
 };
 
+struct FrameSpike {
+    uint32_t frameSlot;
+    double   gpuMs;
+    double   p99Ms;
+};
+
 class GPUProfiler {
 public:
     static constexpr uint32_t kMaxPasses = 8;
@@ -58,6 +64,8 @@ public:
         return m_frameReports.empty() ? kEmpty : m_frameReports.back();
     }
 
+    const std::vector<FrameSpike>& spikes() const { return m_spikes; }
+
     // Aggregate stats across all collected frames
     void printSummary() const;
     void exportJSON(const std::string& path) const;
@@ -81,6 +89,7 @@ private:
     // Accumulated per-pass history for summary
     std::unordered_map<std::string, std::vector<double>> m_passHistory;
     std::vector<FrameGPUReport>                          m_frameReports;
+    std::vector<FrameSpike>                              m_spikes;
 
     static constexpr uint32_t kStatsCount = 7;
 };

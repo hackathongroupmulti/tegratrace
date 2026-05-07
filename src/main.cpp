@@ -7,6 +7,7 @@
 #include "profiling/GPUProfiler.h"
 #include "ui/DebugUI.h"
 #include "capture/FrameCapture.h"
+#include "capture/FrameReplayer.h"
 #include "validation/RegressionTester.h"
 #include "metrics/MetricsCollector.h"
 
@@ -91,25 +92,19 @@ int main(int argc, char** argv) {
 
             tgt::Pipeline    pipeline(ctx, renderPass, swapchain.extent(), pipelineCfg);
             tgt::Renderer    renderer(ctx, swapchain, renderPass, pipeline);
+            renderer.setScene(cfg.scene);
 
             tgt::GPUProfiler      profiler(ctx, tgt::Swapchain::kMaxFramesInFlight);
             renderer.setProfiler(&profiler);
-
-            // Scene 1: 8×8 cube field using cube_field.vert (instanced)
-            std::unique_ptr<tgt::Pipeline> scenePipeline;
-            if (cfg.scene == 1) {
-                tgt::PipelineConfig sceneCfg{};
-                sceneCfg.vertSpvPath = path("shaders/cube_field.vert.spv");
-                sceneCfg.fragSpvPath = path("shaders/triangle.frag.spv");
-                scenePipeline = std::make_unique<tgt::Pipeline>(
-                    ctx, renderPass, swapchain.extent(), sceneCfg);
-                renderer.setScene(1, scenePipeline.get(), 64);
-            }
 
             std::unique_ptr<tgt::DebugUI> ui;
             if (!cfg.headless)
                 ui = std::make_unique<tgt::DebugUI>(ctx, window->handle(), renderPass.handle(),
                                                      swapchain.imageCount(), renderer.commandPool());
+
+            if (ui) {
+                ui->setSceneCallback([&](int s) { renderer.setScene(s); });
+            }
 
             tgt::MetricsCollector metrics;
             tgt::FrameCapture     capture(path("captures"));
@@ -164,49 +159,12 @@ int main(int argc, char** argv) {
 
             if (!cfg.replayPath.empty()) {
                 // --- Frame replay path ---
-                using json = nlohmann::json;
-                std::ifstream jf(cfg.replayPath);
-                if (!jf) throw std::runtime_error("Cannot open replay file: " + cfg.replayPath);
-                json doc; jf >> doc;
-
-                uint32_t capturedFrameIdx = doc.value("frame", 0u);
-                std::string testName = "frame_" + std::to_string(capturedFrameIdx);
-
-                // Load UBO from first draw call
-                tgt::UniformBufferObject ubo{};
-                if (doc.contains("draw_calls") && !doc["draw_calls"].empty()) {
-                    auto& dc = doc["draw_calls"][0];
-                    if (dc.contains("ubo")) {
-                        auto& u = dc["ubo"];
-                        auto loadMat = [&](const char* key, float* dst) {
-                            if (u.contains(key)) {
-                                auto& arr = u[key];
-                                for (int i = 0; i < 16 && i < (int)arr.size(); ++i)
-                                    dst[i] = arr[i].get<float>();
-                            }
-                        };
-                        loadMat("model", ubo.model);
-                        loadMat("view",  ubo.view);
-                        loadMat("proj",  ubo.proj);
-                    }
+                tgt::FrameReplayer replayer(ctx, swapchain, renderPass, pipeline,
+                                             renderer, regression);
+                bool ok = replayer.replay(cfg.replayPath, renderer.commandPool());
+                if (!ok) {
+                    std::cerr << "[Replay] Failed to replay: " << cfg.replayPath << "\n";
                 }
-                renderer.setUBOOverride(ubo);
-
-                // Warm up (fill the in-flight pipeline), then capture on the last frame
-                for (uint32_t f = 0; f < 4; ++f) {
-                    ctx.setCurrentFrame(f);
-                    renderer.drawFrame(f);
-                }
-                renderer.waitIdle();
-
-                auto result = regression.captureAndTest(
-                    testName, renderer.lastImageIndex(), renderer.commandPool());
-                renderer.clearUBOOverride();
-
-                std::cout << "[Replay] " << cfg.replayPath << "\n"
-                          << "  Test  : " << testName << "\n"
-                          << "  PSNR  : " << result.psnrDb << " dB\n"
-                          << "  Result: " << (result.passed ? "PASS" : "FAIL") << "\n";
             } else {
                 // --- Normal render loop ---
                 std::cout << "[TegraTrace] Rendering " << cfg.targetFrames << " frames"

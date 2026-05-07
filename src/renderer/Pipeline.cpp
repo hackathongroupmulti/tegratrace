@@ -31,10 +31,17 @@ Pipeline::Pipeline(VulkanContext& ctx, RenderPass& renderPass,
     dlci.pBindings    = &uboBinding;
     VK_CHECK(vkCreateDescriptorSetLayout(ctx.device(), &dlci, nullptr, &m_dsLayout));
 
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcRange.offset     = 0;
+    pcRange.size       = 64; // mat4
+
     VkPipelineLayoutCreateInfo plci{};
-    plci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts    = &m_dsLayout;
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &m_dsLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcRange;
     VK_CHECK(vkCreatePipelineLayout(ctx.device(), &plci, nullptr, &m_layout));
 
     Shader vert(ctx.device(), cfg.vertSpvPath);

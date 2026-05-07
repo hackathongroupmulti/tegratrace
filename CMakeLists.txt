@@ -76,6 +76,7 @@ set(SOURCES
     src/renderer/Renderer.cpp
     src/profiling/GPUProfiler.cpp
     src/capture/FrameCapture.cpp
+    src/capture/FrameReplayer.cpp
     src/validation/RegressionTester.cpp
     src/metrics/MetricsCollector.cpp
     src/external/stb_impl.cpp

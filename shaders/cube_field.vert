@@ -1,10 +1,13 @@
 #version 450
 
 layout(binding = 0) uniform UniformBufferObject {
-    mat4 model;
     mat4 view;
     mat4 proj;
 } ubo;
+
+layout(push_constant) uniform PushConstants {
+    mat4 model;
+} pc;
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inColor;
@@ -25,7 +28,7 @@ void main() {
     );
 
     // Apply model's rotation component only (upper-left 3x3 = no translation)
-    vec3 rotated  = mat3(ubo.model) * inPosition;
+    vec3 rotated  = mat3(pc.model) * inPosition;
     vec4 worldPos = vec4(rotated + offset, 1.0);
 
     gl_Position = ubo.proj * ubo.view * worldPos;

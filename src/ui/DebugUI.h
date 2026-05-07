@@ -3,6 +3,7 @@
 #include <string>
 #include <deque>
 #include <cstdint>
+#include <functional>
 
 struct GLFWwindow;
 
@@ -24,6 +25,8 @@ struct UIFrameData {
 
 class DebugUI {
 public:
+    using SceneCallback = std::function<void(int)>;
+
     DebugUI(VulkanContext& ctx, GLFWwindow* window,
             VkRenderPass renderPass, uint32_t imageCount,
             VkCommandPool cmdPool);
@@ -35,6 +38,8 @@ public:
     void newFrame();
     void render(VkCommandBuffer cmd, const UIFrameData& data);
 
+    void setSceneCallback(SceneCallback cb) { m_sceneCallback = std::move(cb); }
+
 private:
     void buildPanels(const UIFrameData& data);
 
@@ -44,6 +49,9 @@ private:
     static constexpr int kHistorySize = 128;
     std::deque<float> m_gpuHistory;
     std::deque<float> m_cpuHistory;
+
+    SceneCallback m_sceneCallback;
+    int           m_activeScene = 0;
 };
 
 } // namespace tgt
