@@ -8,10 +8,16 @@ namespace tgt {
 struct CapturedDrawCall {
     uint32_t    vertexCount;
     uint32_t    instanceCount;
+    uint32_t    indexCount;
     uint32_t    firstVertex;
     std::string pipeline;
+    std::string vertShader;
+    std::string fragShader;
     float       viewportW, viewportH;
-    double      cpuTimeUs;   // CPU-side recording time
+    double      cpuTimeUs;
+    float       model[16];
+    float       view[16];
+    float       proj[16];
 };
 
 struct CapturedFrame {

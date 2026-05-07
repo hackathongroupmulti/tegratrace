@@ -13,7 +13,10 @@ namespace tgt {
 
 Pipeline::Pipeline(VulkanContext& ctx, RenderPass& renderPass,
                    VkExtent2D extent, const PipelineConfig& cfg)
-    : m_ctx(ctx), m_name(std::filesystem::path(cfg.vertSpvPath).stem().string())
+    : m_ctx(ctx),
+      m_name(std::filesystem::path(cfg.vertSpvPath).stem().string()),
+      m_vertSpvPath(cfg.vertSpvPath),
+      m_fragSpvPath(cfg.fragSpvPath)
 {
     // Uniform buffer descriptor set layout (binding 0 = UBO)
     VkDescriptorSetLayoutBinding uboBinding{};

@@ -11,7 +11,8 @@ class Swapchain {
 public:
     static constexpr int kMaxFramesInFlight = 2;
 
-    Swapchain(VulkanContext& ctx, Window& window, VkSurfaceKHR surface);
+    // Pass window=nullptr and surface=VK_NULL_HANDLE for headless offscreen mode
+    Swapchain(VulkanContext& ctx, Window* window, VkSurfaceKHR surface);
     ~Swapchain();
 
     Swapchain(const Swapchain&) = delete;
@@ -30,23 +31,35 @@ public:
     VkImage                  image(uint32_t i)    const { return m_images[i]; }
     uint32_t                 currentFrame()     const { return m_currentFrame; }
 
+    bool isHeadless() const { return m_swapchain == VK_NULL_HANDLE; }
+    // Layout the color attachment is in after the render pass completes
+    VkImageLayout colorFinalLayout() const {
+        return isHeadless() ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                            : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    }
+
 private:
     void create();
+    void createOffscreen();
     void cleanup();
+    void cleanupOffscreen();
+    VkResult acquireNextImageOffscreen(uint32_t* imageIndex);
+    VkResult submitAndPresentOffscreen(uint32_t imageIndex, VkCommandBuffer cmd);
 
     VkSurfaceFormatKHR chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats);
     VkPresentModeKHR   choosePresentMode(const std::vector<VkPresentModeKHR>& modes);
     VkExtent2D         chooseExtent(const VkSurfaceCapabilitiesKHR& caps);
 
     VulkanContext&   m_ctx;
-    Window&          m_window;
+    Window*          m_window;
     VkSurfaceKHR     m_surface;
 
-    VkSwapchainKHR          m_swapchain  = VK_NULL_HANDLE;
-    std::vector<VkImage>    m_images;
-    std::vector<VkImageView> m_imageViews;
-    VkFormat                m_imageFormat{};
-    VkExtent2D              m_extent{};
+    VkSwapchainKHR            m_swapchain  = VK_NULL_HANDLE;
+    std::vector<VkImage>      m_images;
+    std::vector<VkImageView>  m_imageViews;
+    std::vector<VkDeviceMemory> m_imageMemories; // used by offscreen path only
+    VkFormat                  m_imageFormat{};
+    VkExtent2D                m_extent{};
 
     std::vector<VkSemaphore> m_imageAvailableSemaphores;
     std::vector<VkSemaphore> m_renderFinishedSemaphores;

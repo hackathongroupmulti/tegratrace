@@ -3,6 +3,7 @@
 #include <vector>
 #include <optional>
 #include <string>
+#include <mutex>
 
 namespace tgt {
 
@@ -18,9 +19,17 @@ struct SwapchainSupportDetails {
     std::vector<VkPresentModeKHR> presentModes;
 };
 
+enum class ValidationSeverity { Info, Warning, Error };
+
+struct ValidationMessage {
+    ValidationSeverity severity;
+    std::string        text;
+    uint32_t           frame = 0;
+};
+
 class VulkanContext {
 public:
-    explicit VulkanContext(bool enableValidation = true);
+    explicit VulkanContext(bool enableValidation = true, bool headless = false);
     ~VulkanContext();
 
     VulkanContext(const VulkanContext&) = delete;
@@ -43,6 +52,10 @@ public:
 
     VkCommandBuffer beginSingleTimeCommands(VkCommandPool pool) const;
     void            endSingleTimeCommands(VkCommandPool pool, VkCommandBuffer cmd) const;
+
+    // Validation log — populated when validation layers are active
+    void setCurrentFrame(uint32_t frame) { m_currentFrame = frame; }
+    const std::vector<ValidationMessage>& validationLog() const { return m_validationLog; }
 
 private:
     void createInstance();
@@ -71,6 +84,11 @@ private:
     QueueFamilyIndices       m_queueFamilies;
     float                    m_timestampPeriod = 1.0f;
     bool                     m_validation;
+    bool                     m_headless;
+
+    uint32_t                      m_currentFrame = 0;
+    mutable std::mutex            m_logMutex;
+    std::vector<ValidationMessage> m_validationLog;
 
     static const std::vector<const char*> kValidationLayers;
     static const std::vector<const char*> kDeviceExtensions;

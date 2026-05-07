@@ -162,6 +162,11 @@ void Renderer::createDescriptorSets() {
 }
 
 void Renderer::updateUniformBuffer(uint32_t frame, uint32_t frameNumber) {
+    if (m_hasUBOOverride) {
+        m_lastUBO = m_uboOverride;
+        m_uniformBuffers[frame]->writeHostVisible(&m_lastUBO, sizeof(m_lastUBO));
+        return;
+    }
     UniformBufferObject ubo{};
     float angle = frameNumber * 0.016f;  // ~1 full rotation per 400 frames
 
@@ -179,6 +184,7 @@ void Renderer::updateUniformBuffer(uint32_t frame, uint32_t frameNumber) {
     memcpy(ubo.view,  glm::value_ptr(view),  sizeof(ubo.view));
     memcpy(ubo.proj,  glm::value_ptr(proj),  sizeof(ubo.proj));
 
+    m_lastUBO = ubo;
     m_uniformBuffers[frame]->writeHostVisible(&ubo, sizeof(ubo));
 }
 
@@ -213,8 +219,10 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     rbi.clearValueCount = static_cast<uint32_t>(clearValues.size());
     rbi.pClearValues    = clearValues.data();
 
+    Pipeline& activePipeline = m_activePipeline ? *m_activePipeline : m_pipeline;
+
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.handle());
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline.handle());
 
     VkViewport vp{ 0, 0, static_cast<float>(ext.width), static_cast<float>(ext.height), 0, 1 };
     VkRect2D   sc{ {0, 0}, ext };
@@ -222,27 +230,33 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     vkCmdSetScissor(cmd, 0, 1, &sc);
 
     VkBuffer vbuf = m_vertexBuffer->handle();
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &offset);
+    VkDeviceSize vbOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &vbOffset);
     vkCmdBindIndexBuffer(cmd, m_indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT16);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                             m_pipeline.layout(), 0, 1,
+                             activePipeline.layout(), 0, 1,
                              &m_descriptorSets[frameIdx % Swapchain::kMaxFramesInFlight],
                              0, nullptr);
 
-    vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+    vkCmdDrawIndexed(cmd, m_indexCount, m_instanceCount, 0, 0, 0);
     stats.drawCalls++;
-    stats.indexCount += m_indexCount;
-    stats.vertexCount += static_cast<uint32_t>(kCubeVerts.size());
+    stats.indexCount  += m_indexCount * m_instanceCount;
+    stats.vertexCount += static_cast<uint32_t>(kCubeVerts.size()) * m_instanceCount;
 
     if (m_captureCallback) {
         DrawCallRecord rec{};
         rec.vertexCount    = static_cast<uint32_t>(kCubeVerts.size());
-        rec.instanceCount  = 1;
+        rec.instanceCount  = m_instanceCount;
+        rec.indexCount     = m_indexCount * m_instanceCount;
         rec.firstVertex    = 0;
-        rec.pipeline       = m_pipeline.name();
+        rec.pipeline       = activePipeline.name();
+        rec.vertShader     = activePipeline.vertSpvPath();
+        rec.fragShader     = activePipeline.fragSpvPath();
         rec.viewportW      = static_cast<float>(ext.width);
         rec.viewportH      = static_cast<float>(ext.height);
+        memcpy(rec.model, m_lastUBO.model, sizeof(rec.model));
+        memcpy(rec.view,  m_lastUBO.view,  sizeof(rec.view));
+        memcpy(rec.proj,  m_lastUBO.proj,  sizeof(rec.proj));
         m_captureCallback(frameNumber, {rec});
     }
 

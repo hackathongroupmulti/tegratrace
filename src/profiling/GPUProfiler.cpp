@@ -160,12 +160,23 @@ void GPUProfiler::printSummary() const {
     double p95 = totals[totals.size() * 95 / 100];
     double p99 = totals[totals.size() * 99 / 100];
 
+    double spikeThreshold = p99 * 1.5;
+    std::vector<size_t> spikeFrames;
+    for (size_t i = 0; i < m_frameReports.size(); ++i)
+        if (m_frameReports[i].totalGpuMs > spikeThreshold) spikeFrames.push_back(i);
+
     std::cout << "\n=== GPU Profiling Summary ===\n";
     std::cout << "  Frames sampled : " << m_frameReports.size() << "\n";
     std::cout << "  Total GPU avg  : " << avg  << " ms\n";
     std::cout << "  p50 GPU frame  : " << p50  << " ms\n";
     std::cout << "  p95 GPU frame  : " << p95  << " ms\n";
     std::cout << "  p99 GPU frame  : " << p99  << " ms\n";
+    std::cout << "  Spikes (>p99x1.5=" << spikeThreshold << " ms): " << spikeFrames.size() << "\n";
+    if (!spikeFrames.empty()) {
+        std::cout << "    Frame indices:";
+        for (auto idx : spikeFrames) std::cout << " " << idx;
+        std::cout << "\n";
+    }
 
     for (auto& [name, history] : m_passHistory) {
         double passAvg = std::accumulate(history.begin(), history.end(), 0.0) / history.size();
@@ -182,13 +193,21 @@ void GPUProfiler::exportJSON(const std::string& path) const {
     if (!totals.empty()) {
         std::sort(totals.begin(), totals.end());
         double avg = std::accumulate(totals.begin(), totals.end(), 0.0) / totals.size();
+        double p99 = totals[totals.size() * 99 / 100];
         doc["gpu_summary"]["frames"]         = m_frameReports.size();
         doc["gpu_summary"]["avg_ms"]         = avg;
         doc["gpu_summary"]["p50_ms"]         = totals[totals.size() * 50 / 100];
         doc["gpu_summary"]["p95_ms"]         = totals[totals.size() * 95 / 100];
-        doc["gpu_summary"]["p99_ms"]         = totals[totals.size() * 99 / 100];
+        doc["gpu_summary"]["p99_ms"]         = p99;
         doc["gpu_summary"]["min_ms"]         = totals.front();
         doc["gpu_summary"]["max_ms"]         = totals.back();
+
+        double spikeThreshold = p99 * 1.5;
+        json spikeList = json::array();
+        for (size_t i = 0; i < m_frameReports.size(); ++i)
+            if (m_frameReports[i].totalGpuMs > spikeThreshold) spikeList.push_back(i);
+        doc["gpu_summary"]["spike_threshold_ms"] = spikeThreshold;
+        doc["gpu_summary"]["spike_frames"]       = spikeList;
     }
 
     json passes = json::array();

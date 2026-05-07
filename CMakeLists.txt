@@ -109,6 +109,7 @@ if(GLSLC)
     compile_shader(tegratrace shaders/triangle.frag)
     compile_shader(tegratrace shaders/mesh.vert)
     compile_shader(tegratrace shaders/mesh.frag)
+    compile_shader(tegratrace shaders/cube_field.vert)
     add_custom_command(TARGET tegratrace POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_BINARY_DIR}/shaders"

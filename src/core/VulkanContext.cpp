@@ -20,8 +20,8 @@ const std::vector<const char*> VulkanContext::kDeviceExtensions = {
     if (_r != VK_SUCCESS) throw std::runtime_error(std::string(#x " failed: ") + std::to_string(_r)); \
 } while(0)
 
-VulkanContext::VulkanContext(bool enableValidation)
-    : m_validation(enableValidation)
+VulkanContext::VulkanContext(bool enableValidation, bool headless)
+    : m_validation(enableValidation), m_headless(headless)
 {
     createInstance();
     if (m_validation) setupDebugMessenger();
@@ -38,8 +38,7 @@ VulkanContext::~VulkanContext() {
 }
 
 void VulkanContext::initSurface(VkSurfaceKHR surface) {
-    pickPhysicalDevice();   // needs surface for present support check - store it temporarily
-    // Re-query with surface
+    pickPhysicalDevice();
     m_queueFamilies = findQueueFamilies(m_physicalDevice, surface);
     createLogicalDevice();
 }
@@ -56,14 +55,15 @@ void VulkanContext::createInstance() {
     appInfo.engineVersion      = VK_MAKE_VERSION(0, 1, 0);
     appInfo.apiVersion         = VK_API_VERSION_1_2;
 
-    std::vector<const char*> extensions = {
-        VK_KHR_SURFACE_EXTENSION_NAME,
+    std::vector<const char*> extensions;
+    if (!m_headless) {
+        extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
 #ifdef _WIN32
-        "VK_KHR_win32_surface",
+        extensions.push_back("VK_KHR_win32_surface");
 #elif defined(__linux__)
-        "VK_KHR_xcb_surface",
+        extensions.push_back("VK_KHR_xcb_surface");
 #endif
-    };
+    }
     if (m_validation)
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
@@ -89,6 +89,7 @@ void VulkanContext::setupDebugMessenger() {
                          VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                          VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
     ci.pfnUserCallback = debugCallback;
+    ci.pUserData       = this;
 
     auto fn = (PFN_vkCreateDebugUtilsMessengerEXT)
         vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT");
@@ -132,6 +133,9 @@ int VulkanContext::scoreDevice(VkPhysicalDevice dev) const {
 }
 
 bool VulkanContext::checkDeviceExtensionSupport(VkPhysicalDevice dev) const {
+    // Offscreen headless path needs no device extensions beyond what's always present
+    if (m_headless) return true;
+
     uint32_t count;
     vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> available(count);
@@ -163,6 +167,9 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice dev, VkSurf
         if (presentSupport) indices.present = i;
         if (indices.isComplete()) break;
     }
+    // In headless mode (no surface), the graphics queue handles everything
+    if (surface == VK_NULL_HANDLE && indices.graphics.has_value())
+        indices.present = indices.graphics;
     return indices;
 }
 
@@ -191,8 +198,10 @@ void VulkanContext::createLogicalDevice() {
     ci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     ci.queueCreateInfoCount    = static_cast<uint32_t>(queueCIs.size());
     ci.pQueueCreateInfos       = queueCIs.data();
-    ci.enabledExtensionCount   = static_cast<uint32_t>(kDeviceExtensions.size());
-    ci.ppEnabledExtensionNames = kDeviceExtensions.data();
+    if (!m_headless) {
+        ci.enabledExtensionCount   = static_cast<uint32_t>(kDeviceExtensions.size());
+        ci.ppEnabledExtensionNames = kDeviceExtensions.data();
+    }
     ci.pEnabledFeatures        = &features;
     if (m_validation) {
         ci.enabledLayerCount   = static_cast<uint32_t>(kValidationLayers.size());
@@ -282,10 +291,23 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT,
     const VkDebugUtilsMessengerCallbackDataEXT* pData,
-    void*)
+    void* pUser)
 {
-    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+    ValidationSeverity sev = ValidationSeverity::Info;
+    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+        sev = ValidationSeverity::Error;
+    else if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+        sev = ValidationSeverity::Warning;
+
+    if (sev != ValidationSeverity::Info)
         std::cerr << "[Vulkan] " << pData->pMessage << "\n";
+
+    if (pUser) {
+        auto* ctx = static_cast<VulkanContext*>(pUser);
+        ValidationMessage msg{ sev, pData->pMessage, ctx->m_currentFrame };
+        std::lock_guard<std::mutex> lock(ctx->m_logMutex);
+        ctx->m_validationLog.push_back(std::move(msg));
+    }
     return VK_FALSE;
 }
 

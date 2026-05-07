@@ -53,10 +53,21 @@ void FrameCapture::writeFrameJSON(const CapturedFrame& frame) const {
         json d;
         d["vertex_count"]   = dc.vertexCount;
         d["instance_count"] = dc.instanceCount;
+        d["index_count"]    = dc.indexCount;
         d["first_vertex"]   = dc.firstVertex;
         d["pipeline"]       = dc.pipeline;
+        d["vert_shader"]    = dc.vertShader;
+        d["frag_shader"]    = dc.fragShader;
         d["viewport"]       = { {"w", dc.viewportW}, {"h", dc.viewportH} };
         d["cpu_time_us"]    = dc.cpuTimeUs;
+        auto matToArray = [](const float* m, int n) {
+            json a = json::array();
+            for (int i = 0; i < n; ++i) a.push_back(m[i]);
+            return a;
+        };
+        d["ubo"]["model"] = matToArray(dc.model, 16);
+        d["ubo"]["view"]  = matToArray(dc.view,  16);
+        d["ubo"]["proj"]  = matToArray(dc.proj,  16);
         draws.push_back(d);
     }
     doc["draw_calls"] = draws;

@@ -1,6 +1,7 @@
 #include "DebugUI.h"
 #include "core/VulkanContext.h"
 #include <imgui.h>
+#include <algorithm>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 #include <stdexcept>
@@ -115,6 +116,40 @@ void DebugUI::buildPanels(const UIFrameData& data) {
     ImGui::SetNextWindowSize({310, 55}, ImGuiCond_Once);
     ImGui::Begin("Pipeline Inspector");
     ImGui::Text("Active  %s", data.pipelineName.c_str());
+    ImGui::End();
+
+    // --- Validation Log ---
+    ImGui::SetNextWindowPos({10, 435}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 200}, ImGuiCond_Once);
+    ImGui::Begin("Validation Log");
+    const auto& log = m_ctx.validationLog();
+    if (log.empty()) {
+        ImGui::TextDisabled("No messages");
+    } else {
+        // Show last 32 messages, newest at bottom
+        int start = (int)log.size() > 32 ? (int)log.size() - 32 : 0;
+        for (int i = start; i < (int)log.size(); ++i) {
+            const auto& msg = log[i];
+            ImVec4 col;
+            switch (msg.severity) {
+                case tgt::ValidationSeverity::Error:   col = {1.0f, 0.3f, 0.3f, 1.0f}; break;
+                case tgt::ValidationSeverity::Warning: col = {1.0f, 0.9f, 0.3f, 1.0f}; break;
+                default:                               col = {0.6f, 0.6f, 0.6f, 1.0f}; break;
+            }
+            // Truncate long messages to fit the panel
+            const char* text = msg.text.c_str();
+            size_t len = msg.text.size();
+            char buf[128];
+            if (len > 120) {
+                std::snprintf(buf, sizeof(buf), "[%u] %.116s...", msg.frame, text);
+                ImGui::TextColored(col, "%s", buf);
+            } else {
+                ImGui::TextColored(col, "[%u] %s", msg.frame, text);
+            }
+        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.0f);
+    }
     ImGui::End();
 }
 

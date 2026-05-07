@@ -63,7 +63,8 @@ private:
     ImageDiffResult compareImages(const std::string& testName,
                                   const std::vector<uint8_t>& captured,
                                   uint32_t w, uint32_t h,
-                                  const std::string& refPath) const;
+                                  const std::string& refPath,
+                                  const std::string& diffOutputPath = "") const;
 
     VulkanContext& m_ctx;
     Swapchain&     m_swapchain;

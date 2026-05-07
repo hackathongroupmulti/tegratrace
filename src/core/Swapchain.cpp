@@ -9,15 +9,23 @@ namespace tgt {
 
 #define VK_CHECK(x) do { VkResult _r=(x); if(_r!=VK_SUCCESS) throw std::runtime_error(#x " failed"); } while(0)
 
-Swapchain::Swapchain(VulkanContext& ctx, Window& window, VkSurfaceKHR surface)
+Swapchain::Swapchain(VulkanContext& ctx, Window* window, VkSurfaceKHR surface)
     : m_ctx(ctx), m_window(window), m_surface(surface)
 {
-    create();
+    if (m_surface == VK_NULL_HANDLE)
+        createOffscreen();
+    else
+        create();
 }
 
 Swapchain::~Swapchain() {
-    cleanup();
+    if (isHeadless())
+        cleanupOffscreen();
+    else
+        cleanup();
 }
+
+// ── Windowed path ─────────────────────────────────────────────────────────────
 
 void Swapchain::create() {
     auto support = m_ctx.querySwapchainSupport(m_surface);
@@ -80,7 +88,6 @@ void Swapchain::create() {
         VK_CHECK(vkCreateImageView(m_ctx.device(), &ivi, nullptr, &m_imageViews[i]));
     }
 
-    // Sync objects
     m_imageAvailableSemaphores.resize(kMaxFramesInFlight);
     m_renderFinishedSemaphores.resize(kMaxFramesInFlight);
     m_inFlightFences.resize(kMaxFramesInFlight);
@@ -121,6 +128,7 @@ void Swapchain::recreate() {
 }
 
 VkResult Swapchain::acquireNextImage(uint32_t* imageIndex) {
+    if (isHeadless()) return acquireNextImageOffscreen(imageIndex);
     vkWaitForFences(m_ctx.device(), 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
     return vkAcquireNextImageKHR(m_ctx.device(), m_swapchain, UINT64_MAX,
                                   m_imageAvailableSemaphores[m_currentFrame],
@@ -128,6 +136,7 @@ VkResult Swapchain::acquireNextImage(uint32_t* imageIndex) {
 }
 
 VkResult Swapchain::submitAndPresent(uint32_t imageIndex, VkCommandBuffer cmd) {
+    if (isHeadless()) return submitAndPresentOffscreen(imageIndex, cmd);
     if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
         vkWaitForFences(m_ctx.device(), 1, &m_imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
     m_imagesInFlight[imageIndex] = m_inFlightFences[m_currentFrame];
@@ -158,6 +167,104 @@ VkResult Swapchain::submitAndPresent(uint32_t imageIndex, VkCommandBuffer cmd) {
     return vkQueuePresentKHR(m_ctx.presentQueue(), &pi);
 }
 
+// ── Offscreen / headless path ─────────────────────────────────────────────────
+
+void Swapchain::createOffscreen() {
+    m_imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    m_extent      = { 1280, 720 };
+
+    uint32_t count = kMaxFramesInFlight;
+    m_images.resize(count);
+    m_imageViews.resize(count);
+    m_imageMemories.resize(count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        VkImageCreateInfo ici{};
+        ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType     = VK_IMAGE_TYPE_2D;
+        ici.extent        = { m_extent.width, m_extent.height, 1 };
+        ici.mipLevels     = 1;
+        ici.arrayLayers   = 1;
+        ici.format        = m_imageFormat;
+        ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ici.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        VK_CHECK(vkCreateImage(m_ctx.device(), &ici, nullptr, &m_images[i]));
+
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(m_ctx.device(), m_images[i], &req);
+        VkMemoryAllocateInfo ai{};
+        ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize  = req.size;
+        ai.memoryTypeIndex = m_ctx.findMemoryType(req.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_CHECK(vkAllocateMemory(m_ctx.device(), &ai, nullptr, &m_imageMemories[i]));
+        vkBindImageMemory(m_ctx.device(), m_images[i], m_imageMemories[i], 0);
+
+        VkImageViewCreateInfo ivi{};
+        ivi.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivi.image                           = m_images[i];
+        ivi.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
+        ivi.format                          = m_imageFormat;
+        ivi.components                      = { VK_COMPONENT_SWIZZLE_IDENTITY };
+        ivi.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        ivi.subresourceRange.baseMipLevel   = 0;
+        ivi.subresourceRange.levelCount     = 1;
+        ivi.subresourceRange.baseArrayLayer = 0;
+        ivi.subresourceRange.layerCount     = 1;
+        VK_CHECK(vkCreateImageView(m_ctx.device(), &ivi, nullptr, &m_imageViews[i]));
+    }
+
+    m_inFlightFences.resize(kMaxFramesInFlight);
+    m_imagesInFlight.resize(count, VK_NULL_HANDLE);
+
+    VkFenceCreateInfo fi{};
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    for (int i = 0; i < kMaxFramesInFlight; ++i)
+        VK_CHECK(vkCreateFence(m_ctx.device(), &fi, nullptr, &m_inFlightFences[i]));
+}
+
+void Swapchain::cleanupOffscreen() {
+    for (auto iv : m_imageViews) vkDestroyImageView(m_ctx.device(), iv, nullptr);
+    for (size_t i = 0; i < m_images.size(); ++i) {
+        vkDestroyImage(m_ctx.device(), m_images[i], nullptr);
+        vkFreeMemory(m_ctx.device(), m_imageMemories[i], nullptr);
+    }
+    m_imageViews.clear(); m_images.clear(); m_imageMemories.clear();
+    for (int i = 0; i < kMaxFramesInFlight; ++i)
+        vkDestroyFence(m_ctx.device(), m_inFlightFences[i], nullptr);
+    m_inFlightFences.clear();
+    m_imagesInFlight.clear();
+}
+
+VkResult Swapchain::acquireNextImageOffscreen(uint32_t* imageIndex) {
+    vkWaitForFences(m_ctx.device(), 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
+    *imageIndex = m_currentFrame;
+    return VK_SUCCESS;
+}
+
+VkResult Swapchain::submitAndPresentOffscreen(uint32_t imageIndex, VkCommandBuffer cmd) {
+    if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
+        vkWaitForFences(m_ctx.device(), 1, &m_imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
+    m_imagesInFlight[imageIndex] = m_inFlightFences[m_currentFrame];
+
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cmd;
+
+    vkResetFences(m_ctx.device(), 1, &m_inFlightFences[m_currentFrame]);
+    VK_CHECK(vkQueueSubmit(m_ctx.graphicsQueue(), 1, &si, m_inFlightFences[m_currentFrame]));
+
+    m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
+    return VK_SUCCESS;
+}
+
+// ── Format helpers ────────────────────────────────────────────────────────────
+
 VkSurfaceFormatKHR Swapchain::chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) {
     for (auto& f : formats)
         if (f.format == VK_FORMAT_B8G8R8A8_UNORM &&
@@ -173,8 +280,9 @@ VkPresentModeKHR Swapchain::choosePresentMode(const std::vector<VkPresentModeKHR
 VkExtent2D Swapchain::chooseExtent(const VkSurfaceCapabilitiesKHR& caps) {
     if (caps.currentExtent.width != std::numeric_limits<uint32_t>::max())
         return caps.currentExtent;
-    VkExtent2D ext = { static_cast<uint32_t>(m_window.width()),
-                       static_cast<uint32_t>(m_window.height()) };
+    int w = m_window ? m_window->width()  : 1280;
+    int h = m_window ? m_window->height() : 720;
+    VkExtent2D ext = { static_cast<uint32_t>(w), static_cast<uint32_t>(h) };
     ext.width  = std::clamp(ext.width,  caps.minImageExtent.width,  caps.maxImageExtent.width);
     ext.height = std::clamp(ext.height, caps.minImageExtent.height, caps.maxImageExtent.height);
     return ext;

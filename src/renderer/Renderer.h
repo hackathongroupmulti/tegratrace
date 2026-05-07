@@ -25,9 +25,15 @@ struct FrameDrawStats {
 struct DrawCallRecord {
     uint32_t    vertexCount;
     uint32_t    instanceCount;
+    uint32_t    indexCount;
     uint32_t    firstVertex;
     std::string pipeline;
+    std::string vertShader;
+    std::string fragShader;
     float       viewportW, viewportH;
+    float       model[16];
+    float       view[16];
+    float       proj[16];
 };
 
 using FrameCallback = std::function<void(uint32_t frame, VkCommandBuffer cmd, FrameDrawStats&)>;
@@ -56,6 +62,11 @@ public:
     void setCaptureCallback(CaptureCallback cb) { m_captureCallback = std::move(cb); }
     void setFrameCallback(FrameCallback cb)     { m_frameCallback   = std::move(cb); }
     void setProfiler(GPUProfiler* p)            { m_profiler = p; }
+    void setScene(int scene, Pipeline* altPipeline, uint32_t instanceCount)
+        { m_scene = scene; m_activePipeline = altPipeline; m_instanceCount = instanceCount; }
+
+    void setUBOOverride(const UniformBufferObject& ubo) { m_uboOverride = ubo; m_hasUBOOverride = true; }
+    void clearUBOOverride()                             { m_hasUBOOverride = false; }
 
     VkCommandPool commandPool()     const { return m_commandPool; }
     uint32_t      lastImageIndex()  const { return m_lastImageIndex; }
@@ -85,12 +96,18 @@ private:
     std::unique_ptr<Buffer> m_vertexBuffer;
     std::unique_ptr<Buffer> m_indexBuffer;
     uint32_t                m_indexCount = 0;
+    UniformBufferObject     m_lastUBO{};
 
     CaptureCallback m_captureCallback;
     FrameCallback   m_frameCallback;
     GPUProfiler*    m_profiler       = nullptr;
-    uint32_t        m_lastImageIndex = 0;
-    uint32_t        m_frameCount     = 0;
+    Pipeline*           m_activePipeline  = nullptr;
+    uint32_t            m_instanceCount   = 1;
+    int                 m_scene           = 0;
+    UniformBufferObject m_uboOverride{};
+    bool                m_hasUBOOverride  = false;
+    uint32_t            m_lastImageIndex  = 0;
+    uint32_t            m_frameCount      = 0;
 };
 
 } // namespace tgt

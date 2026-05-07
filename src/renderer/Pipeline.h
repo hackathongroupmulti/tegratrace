@@ -26,16 +26,20 @@ public:
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
 
-    VkPipeline       handle()       const { return m_pipeline; }
-    VkPipelineLayout layout()       const { return m_layout; }
-    const std::string& name()       const { return m_name; }
+    VkPipeline       handle()           const { return m_pipeline; }
+    VkPipelineLayout layout()           const { return m_layout; }
+    const std::string& name()           const { return m_name; }
+    const std::string& vertSpvPath()    const { return m_vertSpvPath; }
+    const std::string& fragSpvPath()    const { return m_fragSpvPath; }
 
 private:
     VulkanContext& m_ctx;
-    VkPipeline       m_pipeline = VK_NULL_HANDLE;
-    VkPipelineLayout m_layout   = VK_NULL_HANDLE;
+    VkPipeline       m_pipeline  = VK_NULL_HANDLE;
+    VkPipelineLayout m_layout    = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_dsLayout = VK_NULL_HANDLE;
     std::string      m_name;
+    std::string      m_vertSpvPath;
+    std::string      m_fragSpvPath;
 };
 
 } // namespace tgt

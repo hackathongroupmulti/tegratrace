@@ -13,8 +13,11 @@
 #include <iostream>
 #include <string>
 #include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <cstring>
+#include <memory>
+#include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
 
@@ -23,7 +26,10 @@ struct AppConfig {
     bool        captureEnabled = false;
     bool        regression     = false;
     bool        saveRef        = false;
+    bool        headless       = false;
     uint32_t    captureEvery   = 50;
+    int         scene          = 0;
+    std::string replayPath;
     std::string exeDir         = ".";
 };
 
@@ -34,7 +40,10 @@ AppConfig parseArgs(int argc, char** argv) {
         else if (!strcmp(argv[i], "--capture"))                      cfg.captureEnabled = true;
         else if (!strcmp(argv[i], "--regression"))                   cfg.regression     = true;
         else if (!strcmp(argv[i], "--save-ref"))                     cfg.saveRef        = true;
+        else if (!strcmp(argv[i], "--headless"))                     cfg.headless       = true;
         else if (!strcmp(argv[i], "--capture-every") && i+1 < argc) cfg.captureEvery   = std::stoul(argv[++i]);
+        else if (!strcmp(argv[i], "--scene")         && i+1 < argc) cfg.scene           = std::stoi(argv[++i]);
+        else if (!strcmp(argv[i], "--replay")        && i+1 < argc) cfg.replayPath       = argv[++i];
     }
     return cfg;
 }
@@ -43,6 +52,7 @@ int main(int argc, char** argv) {
     auto cfg = parseArgs(argc, argv);
     cfg.exeDir = fs::path(argv[0]).parent_path().string();
     if (cfg.exeDir.empty()) cfg.exeDir = ".";
+    if (!cfg.replayPath.empty()) cfg.headless = true;  // replay is always headless
     auto path = [&](const std::string& rel) { return cfg.exeDir + "/" + rel; };
 
     fs::create_directories(path("captures"));
@@ -56,16 +66,23 @@ int main(int argc, char** argv) {
 #endif
 
     try {
-        tgt::Window        window(1280, 720, "TegraTrace");
-        tgt::VulkanContext ctx(validation);
-        auto surface = window.createSurface(ctx.instance());
-        ctx.initSurface(surface);
+        // Windowed: create a GLFW window first (needed before surface creation)
+        std::unique_ptr<tgt::Window> window;
+        if (!cfg.headless)
+            window = std::make_unique<tgt::Window>(1280, 720, "TegraTrace");
 
-        // Inner scope: all Vulkan objects that depend on the swapchain/surface
-        // are destroyed here (in reverse order) BEFORE we destroy the surface.
-        // Vulkan spec requires: swapchain destroyed before surface, surface before instance.
+        tgt::VulkanContext ctx(validation, cfg.headless);
+
+        // Headless: offscreen path — no surface, no swapchain, graphics queue only
+        // Windowed: create surface, then pick device with present support
+        VkSurfaceKHR surface = VK_NULL_HANDLE;
+        if (!cfg.headless)
+            surface = window->createSurface(ctx.instance());
+        ctx.initSurface(surface);  // VK_NULL_HANDLE → headless device setup
+
+        // Inner scope: Vulkan objects destroyed before surface and instance
         {
-            tgt::Swapchain   swapchain(ctx, window, surface);
+            tgt::Swapchain   swapchain(ctx, window.get(), surface);
             tgt::RenderPass  renderPass(ctx, swapchain);
 
             tgt::PipelineConfig pipelineCfg{};
@@ -77,8 +94,23 @@ int main(int argc, char** argv) {
 
             tgt::GPUProfiler      profiler(ctx, tgt::Swapchain::kMaxFramesInFlight);
             renderer.setProfiler(&profiler);
-            tgt::DebugUI          ui(ctx, window.handle(), renderPass.handle(),
-                                     swapchain.imageCount(), renderer.commandPool());
+
+            // Scene 1: 8×8 cube field using cube_field.vert (instanced)
+            std::unique_ptr<tgt::Pipeline> scenePipeline;
+            if (cfg.scene == 1) {
+                tgt::PipelineConfig sceneCfg{};
+                sceneCfg.vertSpvPath = path("shaders/cube_field.vert.spv");
+                sceneCfg.fragSpvPath = path("shaders/triangle.frag.spv");
+                scenePipeline = std::make_unique<tgt::Pipeline>(
+                    ctx, renderPass, swapchain.extent(), sceneCfg);
+                renderer.setScene(1, scenePipeline.get(), 64);
+            }
+
+            std::unique_ptr<tgt::DebugUI> ui;
+            if (!cfg.headless)
+                ui = std::make_unique<tgt::DebugUI>(ctx, window->handle(), renderPass.handle(),
+                                                     swapchain.imageCount(), renderer.commandPool());
+
             tgt::MetricsCollector metrics;
             tgt::FrameCapture     capture(path("captures"));
             tgt::RegressionTester regression(ctx, swapchain,
@@ -86,21 +118,23 @@ int main(int argc, char** argv) {
 
             uint32_t frameNumber = 0;
 
-            renderer.setFrameCallback(
-                [&](uint32_t /*frame*/, VkCommandBuffer cmd, tgt::FrameDrawStats& stats) {
-                    tgt::UIFrameData data;
-                    data.fps           = static_cast<float>(metrics.currentFPS());
-                    data.cpuFrameMs    = data.fps > 0.0f ? 1000.0f / data.fps : 0.0f;
-                    auto& rep          = profiler.lastReport();
-                    data.gpuFrameMs    = static_cast<float>(rep.totalGpuMs);
-                    data.vsInvocations = rep.pipelineStats.vertexShaderInvocations;
-                    data.fsInvocations = rep.pipelineStats.fragmentShaderInvocations;
-                    data.iaPrimitives  = rep.pipelineStats.inputAssemblyPrimitives;
-                    data.clippingPrims = rep.pipelineStats.clippingPrimitives;
-                    data.drawCalls     = stats.drawCalls;
-                    data.pipelineName  = pipeline.name();
-                    ui.render(cmd, data);
-                });
+            if (!cfg.headless) {
+                renderer.setFrameCallback(
+                    [&](uint32_t /*frame*/, VkCommandBuffer cmd, tgt::FrameDrawStats& stats) {
+                        tgt::UIFrameData data;
+                        data.fps           = static_cast<float>(metrics.currentFPS());
+                        data.cpuFrameMs    = data.fps > 0.0f ? 1000.0f / data.fps : 0.0f;
+                        auto& rep          = profiler.lastReport();
+                        data.gpuFrameMs    = static_cast<float>(rep.totalGpuMs);
+                        data.vsInvocations = rep.pipelineStats.vertexShaderInvocations;
+                        data.fsInvocations = rep.pipelineStats.fragmentShaderInvocations;
+                        data.iaPrimitives  = rep.pipelineStats.inputAssemblyPrimitives;
+                        data.clippingPrims = rep.pipelineStats.clippingPrimitives;
+                        data.drawCalls     = stats.drawCalls;
+                        data.pipelineName  = pipeline.name();
+                        ui->render(cmd, data);
+                    });
+            }
 
             renderer.setCaptureCallback(
                 [&](uint32_t frame, const std::vector<tgt::DrawCallRecord>& draws) {
@@ -113,42 +147,101 @@ int main(int argc, char** argv) {
                         tgt::CapturedDrawCall dc{};
                         dc.vertexCount   = d.vertexCount;
                         dc.instanceCount = d.instanceCount;
+                        dc.indexCount    = d.indexCount;
                         dc.firstVertex   = d.firstVertex;
                         dc.pipeline      = d.pipeline;
+                        dc.vertShader    = d.vertShader;
+                        dc.fragShader    = d.fragShader;
                         dc.viewportW     = d.viewportW;
                         dc.viewportH     = d.viewportH;
+                        std::memcpy(dc.model, d.model, sizeof(dc.model));
+                        std::memcpy(dc.view,  d.view,  sizeof(dc.view));
+                        std::memcpy(dc.proj,  d.proj,  sizeof(dc.proj));
                         cf.drawCalls.push_back(dc);
                     }
                     capture.recordFrame(cf);
                 });
 
-            std::cout << "[TegraTrace] Rendering " << cfg.targetFrames << " frames...\n";
+            if (!cfg.replayPath.empty()) {
+                // --- Frame replay path ---
+                using json = nlohmann::json;
+                std::ifstream jf(cfg.replayPath);
+                if (!jf) throw std::runtime_error("Cannot open replay file: " + cfg.replayPath);
+                json doc; jf >> doc;
 
-            while (!window.shouldClose() && frameNumber < cfg.targetFrames) {
-                window.pollEvents();
+                uint32_t capturedFrameIdx = doc.value("frame", 0u);
+                std::string testName = "frame_" + std::to_string(capturedFrameIdx);
 
-                if (window.wasResized()) {
-                    window.clearResized();
-                    renderer.handleResize();
-                    continue;
+                // Load UBO from first draw call
+                tgt::UniformBufferObject ubo{};
+                if (doc.contains("draw_calls") && !doc["draw_calls"].empty()) {
+                    auto& dc = doc["draw_calls"][0];
+                    if (dc.contains("ubo")) {
+                        auto& u = dc["ubo"];
+                        auto loadMat = [&](const char* key, float* dst) {
+                            if (u.contains(key)) {
+                                auto& arr = u[key];
+                                for (int i = 0; i < 16 && i < (int)arr.size(); ++i)
+                                    dst[i] = arr[i].get<float>();
+                            }
+                        };
+                        loadMat("model", ubo.model);
+                        loadMat("view",  ubo.view);
+                        loadMat("proj",  ubo.proj);
+                    }
                 }
+                renderer.setUBOOverride(ubo);
 
-                metrics.beginFrame();
-                ui.newFrame();
+                // Warm up (fill the in-flight pipeline), then capture on the last frame
+                for (uint32_t f = 0; f < 4; ++f) {
+                    ctx.setCurrentFrame(f);
+                    renderer.drawFrame(f);
+                }
+                renderer.waitIdle();
 
-                bool ok = renderer.drawFrame(frameNumber);
-                frameNumber++;
-                if (!ok) continue;
+                auto result = regression.captureAndTest(
+                    testName, renderer.lastImageIndex(), renderer.commandPool());
+                renderer.clearUBOOverride();
 
-                metrics.endFrame(frameNumber, 0.0, 1, 36);
+                std::cout << "[Replay] " << cfg.replayPath << "\n"
+                          << "  Test  : " << testName << "\n"
+                          << "  PSNR  : " << result.psnrDb << " dB\n"
+                          << "  Result: " << (result.passed ? "PASS" : "FAIL") << "\n";
+            } else {
+                // --- Normal render loop ---
+                std::cout << "[TegraTrace] Rendering " << cfg.targetFrames << " frames"
+                          << (cfg.headless ? " (headless)...\n" : "...\n");
 
-                if (cfg.regression && (frameNumber == 100 || frameNumber == 400)) {
-                    renderer.waitIdle();
-                    std::string testName = "frame_" + std::to_string(frameNumber);
-                    if (cfg.saveRef)
-                        regression.saveReference(testName, renderer.lastImageIndex(), renderer.commandPool());
-                    else
-                        regression.captureAndTest(testName, renderer.lastImageIndex(), renderer.commandPool());
+                while (frameNumber < cfg.targetFrames) {
+                    if (!cfg.headless) {
+                        if (window->shouldClose()) break;
+                        window->pollEvents();
+                        if (window->wasResized()) {
+                            window->clearResized();
+                            renderer.handleResize();
+                            continue;
+                        }
+                    }
+
+                    ctx.setCurrentFrame(frameNumber);
+                    metrics.beginFrame();
+                    if (!cfg.headless) ui->newFrame();
+
+                    uint32_t renderedFrame = frameNumber;
+                    bool ok = renderer.drawFrame(frameNumber);
+                    frameNumber++;
+                    if (!ok) continue;
+
+                    metrics.endFrame(frameNumber, 0.0, 1, 36);
+
+                    if (cfg.regression && (renderedFrame == 100 || renderedFrame == 400)) {
+                        renderer.waitIdle();
+                        std::string testName = "frame_" + std::to_string(renderedFrame);
+                        if (cfg.saveRef)
+                            regression.saveReference(testName, renderer.lastImageIndex(), renderer.commandPool());
+                        else
+                            regression.captureAndTest(testName, renderer.lastImageIndex(), renderer.commandPool());
+                    }
                 }
             }
 
@@ -162,10 +255,10 @@ int main(int argc, char** argv) {
             if (cfg.regression && !cfg.saveRef)
                 regression.exportReport(path("reports/regression.json"));
 
-        } // swapchain, renderPass, pipeline, renderer, profiler, regression all destroyed here
+        } // swapchain, renderPass, pipeline, renderer, profiler, regression destroyed here
 
-        // Surface destroyed after swapchain, before instance (ctx destructor)
-        window.destroySurface(ctx.instance(), surface);
+        if (surface != VK_NULL_HANDLE)
+            window->destroySurface(ctx.instance(), surface);
 
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] " << e.what() << "\n";

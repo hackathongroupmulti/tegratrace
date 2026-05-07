@@ -69,10 +69,10 @@ std::vector<uint8_t> RegressionTester::readbackImage(uint32_t swapchainImageInde
     auto cmd = m_ctx.beginSingleTimeCommands(cmdPool);
     VkImage srcImage = m_swapchain.image(swapchainImageIndex);
 
-    // Transition swapchain image: PRESENT → TRANSFER_SRC
+    // Transition color image: post-render layout → TRANSFER_SRC
     VkImageMemoryBarrier barrier{};
     barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout           = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.oldLayout           = m_swapchain.colorFinalLayout();
     barrier.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -94,9 +94,9 @@ std::vector<uint8_t> RegressionTester::readbackImage(uint32_t swapchainImageInde
     vkCmdCopyImageToBuffer(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            m_stagingBuffer, 1, &region);
 
-    // Transition back: TRANSFER_SRC → PRESENT
+    // Transition back: TRANSFER_SRC → post-render layout
     barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barrier.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.newLayout     = m_swapchain.colorFinalLayout();
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
     vkCmdPipelineBarrier(cmd,
@@ -128,7 +128,8 @@ bool RegressionTester::savePNG(const std::string& path, const std::vector<uint8_
 ImageDiffResult RegressionTester::compareImages(const std::string& testName,
                                                  const std::vector<uint8_t>& captured,
                                                  uint32_t w, uint32_t h,
-                                                 const std::string& refPath) const {
+                                                 const std::string& refPath,
+                                                 const std::string& diffOutputPath) const {
     ImageDiffResult result;
     result.testName    = testName;
     result.totalPixels = w * h;
@@ -152,12 +153,24 @@ ImageDiffResult RegressionTester::compareImages(const std::string& testName,
     double maxDiff   = 0.0;
     uint32_t failed  = 0;
 
+    std::vector<uint8_t> diffPixels;
+    if (!diffOutputPath.empty()) diffPixels.resize(captured.size());
+
     for (size_t i = 0; i < captured.size(); ++i) {
         double diff = static_cast<double>(captured[i]) - static_cast<double>(ref[i]);
         sumSqErr += diff * diff;
         maxDiff = std::max(maxDiff, std::abs(diff));
-        if (std::abs(diff) > 3) ++failed;  // >3 counts per channel as failure
+        if (std::abs(diff) > 3) ++failed;
+        if (!diffOutputPath.empty()) {
+            // Amplify diff ×4, clamp to [0,255], preserve alpha channel as 255
+            uint8_t v = (i % 4 == 3) ? 255u
+                : static_cast<uint8_t>(std::min(255.0, std::abs(diff) * 4.0));
+            diffPixels[i] = v;
+        }
     }
+
+    if (!diffOutputPath.empty() && !diffPixels.empty())
+        savePNG(diffOutputPath, diffPixels, w, h);
 
     stbi_image_free(ref);
 
@@ -182,8 +195,9 @@ ImageDiffResult RegressionTester::captureAndTest(const std::string& testName,
     std::string capturePath = m_outputDir + "/" + testName + "_captured.png";
     savePNG(capturePath, pixels, w, h);
 
-    std::string refPath = m_referenceDir + "/" + testName + ".png";
-    auto result = compareImages(testName, pixels, w, h, refPath);
+    std::string refPath  = m_referenceDir + "/" + testName + ".png";
+    std::string diffPath = m_outputDir    + "/" + testName + "_diff.png";
+    auto result = compareImages(testName, pixels, w, h, refPath, diffPath);
 
     m_report.totalTests++;
     if (result.passed) m_report.passedTests++;
