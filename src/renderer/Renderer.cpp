@@ -246,6 +246,9 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
         m_captureCallback(frameNumber, {rec});
     }
 
+    if (m_frameCallback)
+        m_frameCallback(frameNumber, cmd, stats);
+
     vkCmdEndRenderPass(cmd);
 
     if (m_profiler) {

@@ -40,6 +40,13 @@ FetchContent_Declare(stb
 )
 FetchContent_MakeAvailable(stb)
 
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.5
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
 # ---- Shader compilation ----
 find_program(GLSLC glslc HINTS $ENV{VULKAN_SDK}/bin)
 
@@ -72,6 +79,13 @@ set(SOURCES
     src/validation/RegressionTester.cpp
     src/metrics/MetricsCollector.cpp
     src/external/stb_impl.cpp
+    src/ui/DebugUI.cpp
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
 add_executable(tegratrace ${SOURCES})
@@ -79,6 +93,8 @@ add_executable(tegratrace ${SOURCES})
 target_include_directories(tegratrace PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${stb_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
 )
 
 target_link_libraries(tegratrace PRIVATE

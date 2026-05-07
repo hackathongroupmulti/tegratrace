@@ -5,6 +5,7 @@
 #include "renderer/Pipeline.h"
 #include "renderer/Renderer.h"
 #include "profiling/GPUProfiler.h"
+#include "ui/DebugUI.h"
 #include "capture/FrameCapture.h"
 #include "validation/RegressionTester.h"
 #include "metrics/MetricsCollector.h"
@@ -76,12 +77,30 @@ int main(int argc, char** argv) {
 
             tgt::GPUProfiler      profiler(ctx, tgt::Swapchain::kMaxFramesInFlight);
             renderer.setProfiler(&profiler);
+            tgt::DebugUI          ui(ctx, window.handle(), renderPass.handle(),
+                                     swapchain.imageCount(), renderer.commandPool());
             tgt::MetricsCollector metrics;
             tgt::FrameCapture     capture(path("captures"));
             tgt::RegressionTester regression(ctx, swapchain,
                                               path("references"), path("reports"));
 
             uint32_t frameNumber = 0;
+
+            renderer.setFrameCallback(
+                [&](uint32_t /*frame*/, VkCommandBuffer cmd, tgt::FrameDrawStats& stats) {
+                    tgt::UIFrameData data;
+                    data.fps           = static_cast<float>(metrics.currentFPS());
+                    data.cpuFrameMs    = data.fps > 0.0f ? 1000.0f / data.fps : 0.0f;
+                    auto& rep          = profiler.lastReport();
+                    data.gpuFrameMs    = static_cast<float>(rep.totalGpuMs);
+                    data.vsInvocations = rep.pipelineStats.vertexShaderInvocations;
+                    data.fsInvocations = rep.pipelineStats.fragmentShaderInvocations;
+                    data.iaPrimitives  = rep.pipelineStats.inputAssemblyPrimitives;
+                    data.clippingPrims = rep.pipelineStats.clippingPrimitives;
+                    data.drawCalls     = stats.drawCalls;
+                    data.pipelineName  = pipeline.name();
+                    ui.render(cmd, data);
+                });
 
             renderer.setCaptureCallback(
                 [&](uint32_t frame, const std::vector<tgt::DrawCallRecord>& draws) {
@@ -115,6 +134,7 @@ int main(int argc, char** argv) {
                 }
 
                 metrics.beginFrame();
+                ui.newFrame();
 
                 bool ok = renderer.drawFrame(frameNumber);
                 frameNumber++;

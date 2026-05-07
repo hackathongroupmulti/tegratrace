@@ -52,6 +52,12 @@ public:
     // Read results from last frame (call after submit + fence wait)
     FrameGPUReport readResults(uint32_t frameIdx);
 
+    // Most recent readback result (valid after first kMaxFramesInFlight frames)
+    const FrameGPUReport& lastReport() const {
+        static const FrameGPUReport kEmpty{};
+        return m_frameReports.empty() ? kEmpty : m_frameReports.back();
+    }
+
     // Aggregate stats across all collected frames
     void printSummary() const;
     void exportJSON(const std::string& path) const;

@@ -54,7 +54,8 @@ public:
     void waitIdle();
 
     void setCaptureCallback(CaptureCallback cb) { m_captureCallback = std::move(cb); }
-    void setProfiler(GPUProfiler* p) { m_profiler = p; }
+    void setFrameCallback(FrameCallback cb)     { m_frameCallback   = std::move(cb); }
+    void setProfiler(GPUProfiler* p)            { m_profiler = p; }
 
     VkCommandPool commandPool()     const { return m_commandPool; }
     uint32_t      lastImageIndex()  const { return m_lastImageIndex; }
@@ -86,6 +87,7 @@ private:
     uint32_t                m_indexCount = 0;
 
     CaptureCallback m_captureCallback;
+    FrameCallback   m_frameCallback;
     GPUProfiler*    m_profiler       = nullptr;
     uint32_t        m_lastImageIndex = 0;
     uint32_t        m_frameCount     = 0;
