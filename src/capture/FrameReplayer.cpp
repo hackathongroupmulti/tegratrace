@@ -19,11 +19,14 @@ FrameReplayer::FrameReplayer(VulkanContext& ctx, Swapchain& swapchain, RenderPas
       m_pipeline(pipeline), m_renderer(renderer), m_regression(regression)
 {}
 
-bool FrameReplayer::replay(const std::string& captureJsonPath, VkCommandPool cmdPool) {
+ImageDiffResult FrameReplayer::replay(const std::string& captureJsonPath, VkCommandPool cmdPool) {
+    ImageDiffResult failure{};
+    failure.testName = captureJsonPath;
+
     std::ifstream jf(captureJsonPath);
     if (!jf) {
         std::cerr << "[FrameReplayer] Cannot open: " << captureJsonPath << "\n";
-        return false;
+        return failure;
     }
 
     json doc;
@@ -31,7 +34,7 @@ bool FrameReplayer::replay(const std::string& captureJsonPath, VkCommandPool cmd
         jf >> doc;
     } catch (const std::exception& e) {
         std::cerr << "[FrameReplayer] JSON parse error: " << e.what() << "\n";
-        return false;
+        return failure;
     }
 
     uint32_t frameIndex = doc.value("frame", 0u);
@@ -103,7 +106,7 @@ bool FrameReplayer::replay(const std::string& captureJsonPath, VkCommandPool cmd
               << "  PSNR  : " << result.psnrDb << " dB\n"
               << "  Result: " << (result.passed ? "PASS" : "FAIL (no reference or below threshold)") << "\n";
 
-    return true;
+    return result;
 }
 
 } // namespace tgt

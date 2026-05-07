@@ -287,6 +287,30 @@ bool VulkanContext::checkValidationLayerSupport() const {
     return true;
 }
 
+static std::string deriveSuggestion(const std::string& msg) {
+    if (msg.find("image layout") != std::string::npos || msg.find("imageLayout") != std::string::npos)
+        return "Check image layout transitions and pipeline barriers";
+    if (msg.find("descriptor set") != std::string::npos || msg.find("descriptor binding") != std::string::npos)
+        return "Verify descriptor set is bound and fully updated before draw";
+    if (msg.find("synchronization") != std::string::npos || msg.find("hazard") != std::string::npos)
+        return "Insert pipeline barrier with correct srcStage/dstStage and access masks";
+    if (msg.find("srcAccessMask") != std::string::npos || msg.find("dstAccessMask") != std::string::npos)
+        return "Ensure srcAccessMask/dstAccessMask cover all resource access types";
+    if (msg.find("render pass") != std::string::npos || msg.find("renderPass") != std::string::npos)
+        return "Check render pass begin/end pairing and subpass dependencies";
+    if (msg.find("vertex buffer") != std::string::npos || msg.find("vertexBuffer") != std::string::npos)
+        return "Bind vertex buffer before vkCmdDraw/vkCmdDrawIndexed";
+    if (msg.find("index buffer") != std::string::npos)
+        return "Bind index buffer before vkCmdDrawIndexed";
+    if (msg.find("pipeline") != std::string::npos && msg.find("bound") != std::string::npos)
+        return "Call vkCmdBindPipeline before issuing draw commands";
+    if (msg.find("memory") != std::string::npos && msg.find("access") != std::string::npos)
+        return "Add memory barrier to flush writes before next read";
+    if (msg.find("push constant") != std::string::npos)
+        return "Verify push constant range in pipeline layout covers all shader accesses";
+    return "";
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT,
@@ -304,7 +328,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
 
     if (pUser) {
         auto* ctx = static_cast<VulkanContext*>(pUser);
-        ValidationMessage msg{ sev, pData->pMessage, ctx->m_currentFrame };
+        ValidationMessage msg{};
+        msg.severity   = sev;
+        msg.text       = pData->pMessage;
+        msg.suggestion = deriveSuggestion(pData->pMessage);
+        msg.frame      = ctx->m_currentFrame;
         std::lock_guard<std::mutex> lock(ctx->m_logMutex);
         ctx->m_validationLog.push_back(std::move(msg));
     }

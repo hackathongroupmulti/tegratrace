@@ -24,6 +24,7 @@ enum class ValidationSeverity { Info, Warning, Error };
 struct ValidationMessage {
     ValidationSeverity severity;
     std::string        text;
+    std::string        suggestion;  // actionable hint derived from VUID/message text
     uint32_t           frame = 0;
 };
 

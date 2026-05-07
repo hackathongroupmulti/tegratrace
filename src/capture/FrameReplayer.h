@@ -1,17 +1,18 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include <string>
+#include "validation/RegressionTester.h"
 
 namespace tgt {
 class VulkanContext; class Swapchain; class RenderPass;
-class Pipeline; class Renderer; class RegressionTester;
+class Pipeline; class Renderer;
 
 class FrameReplayer {
 public:
     FrameReplayer(VulkanContext& ctx, Swapchain& swapchain, RenderPass& renderPass,
                   Pipeline& pipeline, Renderer& renderer, RegressionTester& regression);
-    // Returns true if replay succeeded (and PSNR passed if reference exists)
-    bool replay(const std::string& captureJsonPath, VkCommandPool cmdPool);
+    // Returns the image diff result (psnrDb/passed valid if a reference PNG exists)
+    ImageDiffResult replay(const std::string& captureJsonPath, VkCommandPool cmdPool);
 private:
     VulkanContext&    m_ctx;
     Swapchain&        m_swapchain;

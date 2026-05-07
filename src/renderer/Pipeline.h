@@ -26,11 +26,12 @@ public:
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
 
-    VkPipeline       handle()           const { return m_pipeline; }
-    VkPipelineLayout layout()           const { return m_layout; }
-    const std::string& name()           const { return m_name; }
-    const std::string& vertSpvPath()    const { return m_vertSpvPath; }
-    const std::string& fragSpvPath()    const { return m_fragSpvPath; }
+    VkPipeline            handle()        const { return m_pipeline; }
+    VkPipelineLayout      layout()        const { return m_layout; }
+    VkDescriptorSetLayout dsLayout()      const { return m_dsLayout; }
+    const std::string& name()            const { return m_name; }
+    const std::string& vertSpvPath()     const { return m_vertSpvPath; }
+    const std::string& fragSpvPath()     const { return m_fragSpvPath; }
 
 private:
     VulkanContext& m_ctx;

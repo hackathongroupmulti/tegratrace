@@ -1,13 +1,15 @@
 #include "DebugUI.h"
 #include "core/VulkanContext.h"
 #include <imgui.h>
-#include <algorithm>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 namespace tgt {
 
@@ -79,14 +81,26 @@ void DebugUI::buildPanels(const UIFrameData& data) {
     if ((int)m_gpuHistory.size() > kHistorySize) m_gpuHistory.pop_front();
     if ((int)m_cpuHistory.size() > kHistorySize) m_cpuHistory.pop_front();
 
+    // Left column (x=10)
+    panelFrameTiming(data);
+    panelPipelineStats(data);
+    panelPipelineInspector(data);
+    panelValidationLog();
+    panelSceneControl();
+
+    // Right column (x=330)
+    panelCommandBufferInspector(data);
+    panelReplayControls();
+}
+
+void DebugUI::panelFrameTiming(const UIFrameData& data) {
     std::vector<float> gpuVec(m_gpuHistory.begin(), m_gpuHistory.end());
     std::vector<float> cpuVec(m_cpuHistory.begin(), m_cpuHistory.end());
     float gpuMax = *std::max_element(gpuVec.begin(), gpuVec.end());
     float cpuMax = *std::max_element(cpuVec.begin(), cpuVec.end());
 
-    // --- Frame Timing ---
     ImGui::SetNextWindowPos({10, 10}, ImGuiCond_Once);
-    ImGui::SetNextWindowSize({310, 210}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 255}, ImGuiCond_Once);
     ImGui::Begin("Frame Timing");
     ImGui::Text("FPS        %.1f", data.fps);
     ImGui::Text("CPU frame  %.3f ms", data.cpuFrameMs);
@@ -95,13 +109,20 @@ void DebugUI::buildPanels(const UIFrameData& data) {
     char gpuLbl[40]; std::snprintf(gpuLbl, sizeof(gpuLbl), "GPU %.4f ms", data.gpuFrameMs);
     char cpuLbl[40]; std::snprintf(cpuLbl, sizeof(cpuLbl), "CPU %.4f ms", data.cpuFrameMs);
     ImGui::PlotLines("##gpu", gpuVec.data(), (int)gpuVec.size(), 0,
-                     gpuLbl, 0.0f, gpuMax * 1.5f + 0.0001f, {295, 55});
+                     gpuLbl, 0.0f, gpuMax * 1.5f + 0.0001f, {295, 45});
     ImGui::PlotLines("##cpu", cpuVec.data(), (int)cpuVec.size(), 0,
-                     cpuLbl, 0.0f, cpuMax * 1.5f + 0.001f,  {295, 55});
+                     cpuLbl, 0.0f, cpuMax * 1.5f + 0.001f,  {295, 45});
+    ImGui::Separator();
+    ImGui::Text("Barrier probe  %.4f ms", data.barrierMs);
+    ImGui::Text("Frame jitter   %.4f ms", data.jitterMs);
+    if (data.syncSuspected)
+        ImGui::TextColored({1.0f, 0.5f, 0.2f, 1.0f}, "!! Sync stall suspected");
+    ImGui::Text("GPU spikes     %u", data.spikeCount);
     ImGui::End();
+}
 
-    // --- Pipeline Statistics ---
-    ImGui::SetNextWindowPos({10, 230}, ImGuiCond_Once);
+void DebugUI::panelPipelineStats(const UIFrameData& data) {
+    ImGui::SetNextWindowPos({10, 275}, ImGuiCond_Once);
     ImGui::SetNextWindowSize({310, 130}, ImGuiCond_Once);
     ImGui::Begin("Pipeline Statistics");
     ImGui::Text("Draw calls       %u",   data.drawCalls);
@@ -110,23 +131,24 @@ void DebugUI::buildPanels(const UIFrameData& data) {
     ImGui::Text("IA primitives    %llu", (unsigned long long)data.iaPrimitives);
     ImGui::Text("Clip primitives  %llu", (unsigned long long)data.clippingPrims);
     ImGui::End();
+}
 
-    // --- Pipeline Inspector ---
-    ImGui::SetNextWindowPos({10, 370}, ImGuiCond_Once);
+void DebugUI::panelPipelineInspector(const UIFrameData& data) {
+    ImGui::SetNextWindowPos({10, 415}, ImGuiCond_Once);
     ImGui::SetNextWindowSize({310, 55}, ImGuiCond_Once);
     ImGui::Begin("Pipeline Inspector");
     ImGui::Text("Active  %s", data.pipelineName.c_str());
     ImGui::End();
+}
 
-    // --- Validation Log ---
-    ImGui::SetNextWindowPos({10, 435}, ImGuiCond_Once);
+void DebugUI::panelValidationLog() {
+    ImGui::SetNextWindowPos({10, 480}, ImGuiCond_Once);
     ImGui::SetNextWindowSize({310, 200}, ImGuiCond_Once);
     ImGui::Begin("Validation Log");
     const auto& log = m_ctx.validationLog();
     if (log.empty()) {
         ImGui::TextDisabled("No messages");
     } else {
-        // Show last 32 messages, newest at bottom
         int start = (int)log.size() > 32 ? (int)log.size() - 32 : 0;
         for (int i = start; i < (int)log.size(); ++i) {
             const auto& msg = log[i];
@@ -136,24 +158,24 @@ void DebugUI::buildPanels(const UIFrameData& data) {
                 case tgt::ValidationSeverity::Warning: col = {1.0f, 0.9f, 0.3f, 1.0f}; break;
                 default:                               col = {0.6f, 0.6f, 0.6f, 1.0f}; break;
             }
-            // Truncate long messages to fit the panel
-            const char* text = msg.text.c_str();
-            size_t len = msg.text.size();
             char buf[128];
-            if (len > 120) {
-                std::snprintf(buf, sizeof(buf), "[%u] %.116s...", msg.frame, text);
-                ImGui::TextColored(col, "%s", buf);
-            } else {
-                ImGui::TextColored(col, "[%u] %s", msg.frame, text);
-            }
+            if (msg.text.size() > 110)
+                std::snprintf(buf, sizeof(buf), "[%u] %.106s...", msg.frame, msg.text.c_str());
+            else
+                std::snprintf(buf, sizeof(buf), "[%u] %s", msg.frame, msg.text.c_str());
+            ImGui::TextColored(col, "%s", buf);
+
+            if (!msg.suggestion.empty())
+                ImGui::TextColored({0.5f, 0.8f, 1.0f, 1.0f}, "  -> %s", msg.suggestion.c_str());
         }
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
             ImGui::SetScrollHereY(1.0f);
     }
     ImGui::End();
+}
 
-    // --- Scene Control ---
-    ImGui::SetNextWindowPos({10, 645}, ImGuiCond_Once);
+void DebugUI::panelSceneControl() {
+    ImGui::SetNextWindowPos({10, 690}, ImGuiCond_Once);
     ImGui::SetNextWindowSize({310, 75}, ImGuiCond_Once);
     ImGui::Begin("Scene Control");
     ImGui::Text("Active: Scene %d", m_activeScene);
@@ -161,6 +183,72 @@ void DebugUI::buildPanels(const UIFrameData& data) {
     ImGui::SameLine();
     if (ImGui::Button("5x5 Grid")) { m_activeScene = 1; if (m_sceneCallback) m_sceneCallback(1); }
     ImGui::End();
+}
+
+void DebugUI::panelCommandBufferInspector(const UIFrameData& data) {
+    ImGui::SetNextWindowPos({330, 10}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 200}, ImGuiCond_Once);
+    ImGui::Begin("Command Buffer Inspector");
+    ImGui::Text("Draw calls in submission order:");
+    ImGui::Separator();
+    if (data.drawCallList.empty()) {
+        ImGui::TextDisabled("No draw calls recorded");
+    } else {
+        ImGui::BeginChild("##dclist", {0, 0}, false);
+        for (auto& dc : data.drawCallList) {
+            ImGui::Text("#%u  %s", dc.index, dc.pipeline.c_str());
+            ImGui::TextDisabled("    vtx=%u  idx=%u", dc.vertexCount, dc.indexCount);
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
+void DebugUI::panelReplayControls() {
+    ImGui::SetNextWindowPos({330, 220}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 200}, ImGuiCond_Once);
+    ImGui::Begin("Replay Controls");
+
+    if (ImGui::Button("Scan Captures")) scanCaptureFiles();
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d files", (int)m_captureFiles.size());
+
+    if (m_captureFiles.empty()) {
+        ImGui::TextDisabled("No capture files found.");
+        ImGui::TextDisabled("Run with --capture to generate.");
+    } else {
+        if (m_selectedCapture >= (int)m_captureFiles.size())
+            m_selectedCapture = (int)m_captureFiles.size() - 1;
+
+        ImGui::SliderInt("##frame", &m_selectedCapture, 0, (int)m_captureFiles.size() - 1);
+        ImGui::TextDisabled("%s", m_captureFiles[m_selectedCapture].c_str());
+
+        if (ImGui::Button("Replay Selected")) {
+            if (m_replayCallback)
+                m_replayCallback(m_capturesDir + "/" + m_captureFiles[m_selectedCapture]);
+        }
+
+        if (m_replayResultValid) {
+            ImGui::Separator();
+            ImGui::Text("PSNR: %.1f dB", m_lastPsnr);
+            ImGui::TextColored(
+                m_replayPassed ? ImVec4{0.2f,1.0f,0.2f,1.0f} : ImVec4{1.0f,0.3f,0.3f,1.0f},
+                m_replayPassed ? "PASS" : "FAIL");
+        }
+    }
+    ImGui::End();
+}
+
+void DebugUI::scanCaptureFiles() {
+    m_captureFiles.clear();
+    if (m_capturesDir.empty()) return;
+    try {
+        for (auto& entry : fs::directory_iterator(m_capturesDir)) {
+            if (entry.path().extension() == ".json")
+                m_captureFiles.push_back(entry.path().filename().string());
+        }
+        std::sort(m_captureFiles.begin(), m_captureFiles.end());
+    } catch (...) {}
 }
 
 } // namespace tgt

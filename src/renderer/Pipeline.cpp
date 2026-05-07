@@ -18,17 +18,25 @@ Pipeline::Pipeline(VulkanContext& ctx, RenderPass& renderPass,
       m_vertSpvPath(cfg.vertSpvPath),
       m_fragSpvPath(cfg.fragSpvPath)
 {
-    // Uniform buffer descriptor set layout (binding 0 = UBO)
+    // Binding 0: UBO (view+proj, vertex stage)
     VkDescriptorSetLayoutBinding uboBinding{};
     uboBinding.binding         = 0;
     uboBinding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     uboBinding.descriptorCount = 1;
     uboBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
 
+    // Binding 1: texture sampler (fragment stage)
+    VkDescriptorSetLayoutBinding samplerBinding{};
+    samplerBinding.binding         = 1;
+    samplerBinding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    samplerBinding.descriptorCount = 1;
+    samplerBinding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboBinding, samplerBinding };
     VkDescriptorSetLayoutCreateInfo dlci{};
     dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 1;
-    dlci.pBindings    = &uboBinding;
+    dlci.bindingCount = static_cast<uint32_t>(bindings.size());
+    dlci.pBindings    = bindings.data();
     VK_CHECK(vkCreateDescriptorSetLayout(ctx.device(), &dlci, nullptr, &m_dsLayout));
 
     VkPushConstantRange pcRange{};

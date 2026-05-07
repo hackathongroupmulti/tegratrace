@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <stb_image.h>
 #include <stb_image_write.h>
+#include <stb_image_resize2.h>
 
 namespace tgt {
 
@@ -217,6 +218,78 @@ void RegressionTester::saveReference(const std::string& testName,
     std::string path = m_referenceDir + "/" + testName + ".png";
     savePNG(path, pixels, w, h);
     std::cout << "[Regression] Saved reference: " << path << "\n";
+}
+
+void RegressionTester::captureAndTestMultiRes(const std::string& testName,
+                                               uint32_t swapchainImageIndex,
+                                               VkCommandPool cmdPool) {
+    uint32_t w, h;
+    auto pixels = readbackImage(swapchainImageIndex, cmdPool, w, h);
+
+    // Save native-resolution capture
+    savePNG(m_outputDir + "/" + testName + "_captured.png", pixels, w, h);
+
+    struct Scale { uint32_t sw, sh; const char* suffix; };
+    Scale scales[] = {
+        { w,   h,   ""      },
+        { w/2, h/2, "_half" },
+        { w/4, h/4, "_qtr"  },
+    };
+
+    for (auto& sc : scales) {
+        if (sc.sw < 16 || sc.sh < 16) continue;
+
+        std::vector<uint8_t> scaledPx(sc.sw * sc.sh * 4);
+        stbir_resize_uint8_linear(pixels.data(), static_cast<int>(w), static_cast<int>(h), 0,
+                                   scaledPx.data(), static_cast<int>(sc.sw), static_cast<int>(sc.sh), 0,
+                                   STBIR_RGBA);
+
+        std::string scaledName = testName + sc.suffix;
+        std::string refPath    = m_referenceDir + "/" + scaledName + ".png";
+        std::string diffPath   = m_outputDir    + "/" + scaledName + "_diff.png";
+
+        auto result = compareImages(scaledName, scaledPx, sc.sw, sc.sh, refPath, diffPath);
+        m_report.totalTests++;
+        if (result.passed) m_report.passedTests++;
+        m_report.results.push_back(result);
+
+        std::cout << "[Regression] " << scaledName
+                  << " (" << sc.sw << "x" << sc.sh << ")"
+                  << " | PSNR=" << std::fixed << std::setprecision(1) << result.psnrDb << " dB"
+                  << " | " << (result.passed ? "PASS" : "FAIL") << "\n";
+    }
+}
+
+void RegressionTester::saveReferenceMultiRes(const std::string& testName,
+                                              uint32_t swapchainImageIndex,
+                                              VkCommandPool cmdPool) {
+    uint32_t w, h;
+    auto pixels = readbackImage(swapchainImageIndex, cmdPool, w, h);
+
+    struct Scale { uint32_t sw, sh; const char* suffix; };
+    Scale scales[] = {
+        { w,   h,   ""      },
+        { w/2, h/2, "_half" },
+        { w/4, h/4, "_qtr"  },
+    };
+
+    for (auto& sc : scales) {
+        if (sc.sw < 16 || sc.sh < 16) continue;
+
+        if (sc.sw == w && sc.sh == h) {
+            std::string path = m_referenceDir + "/" + testName + ".png";
+            savePNG(path, pixels, w, h);
+            std::cout << "[Regression] Saved reference: " << path << "\n";
+        } else {
+            std::vector<uint8_t> scaledPx(sc.sw * sc.sh * 4);
+            stbir_resize_uint8_linear(pixels.data(), static_cast<int>(w), static_cast<int>(h), 0,
+                                      scaledPx.data(), static_cast<int>(sc.sw), static_cast<int>(sc.sh), 0,
+                                      STBIR_RGBA);
+            std::string path = m_referenceDir + "/" + testName + sc.suffix + ".png";
+            savePNG(path, scaledPx, sc.sw, sc.sh);
+            std::cout << "[Regression] Saved reference: " << path << "\n";
+        }
+    }
 }
 
 void RegressionTester::exportReport(const std::string& path) const {

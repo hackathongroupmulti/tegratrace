@@ -162,7 +162,24 @@ FrameGPUReport GPUProfiler::readResults(uint32_t frameIdx) {
 
     info.count = 0;
     m_frameReports.push_back(report);
-    return report;
+
+    // Jitter / sync stall detection: compare to rolling mean of last 30 frames
+    size_t n = m_frameReports.size();
+    if (n >= 10) {
+        size_t start = n >= 30 ? n - 30 : 0;
+        double sum = 0.0;
+        size_t count = n - 1 - start;
+        if (count > 0) {
+            for (size_t i = start; i < n - 1; ++i)
+                sum += m_frameReports[i].totalGpuMs;
+            double mean = sum / static_cast<double>(count);
+            double jitter = std::abs(report.totalGpuMs - mean);
+            m_frameReports.back().jitterMs      = jitter;
+            m_frameReports.back().syncSuspected = (mean > 0.001 && jitter > mean * 0.5);
+        }
+    }
+
+    return m_frameReports.back();
 }
 
 void GPUProfiler::printSummary() const {

@@ -79,6 +79,9 @@ public:
     int  scene()  const                           { return m_scene; }
     void setReplayData(const ReplayFrameData* d)  { m_replayData = d; }
 
+    // Returns the draw call records from the most recently completed frame
+    const std::vector<DrawCallRecord>& lastDrawCalls() const { return m_lastDrawCalls; }
+
     VkCommandPool commandPool()     const { return m_commandPool; }
     uint32_t      lastImageIndex()  const { return m_lastImageIndex; }
 
@@ -103,10 +106,18 @@ private:
     std::vector<VkDescriptorSet>      m_descriptorSets;
     std::vector<std::unique_ptr<Buffer>> m_uniformBuffers;
 
+    void createTexture();
+
     // Demo geometry (colored cube)
     std::unique_ptr<Buffer> m_vertexBuffer;
     std::unique_ptr<Buffer> m_indexBuffer;
     uint32_t                m_indexCount = 0;
+
+    // Procedural texture (UV-gradient, uploaded once at init)
+    VkImage        m_textureImage  = VK_NULL_HANDLE;
+    VkDeviceMemory m_textureMemory = VK_NULL_HANDLE;
+    VkImageView    m_textureView   = VK_NULL_HANDLE;
+    VkSampler      m_sampler       = VK_NULL_HANDLE;
 
     CaptureCallback m_captureCallback;
     FrameCallback   m_frameCallback;
@@ -116,6 +127,8 @@ private:
 
     float    m_currentView[16]{};
     float    m_currentProj[16]{};
+
+    std::vector<DrawCallRecord> m_lastDrawCalls;
 
     uint32_t m_lastImageIndex  = 0;
     uint32_t m_frameCount      = 0;

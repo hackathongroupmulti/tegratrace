@@ -28,6 +28,7 @@ struct AppConfig {
     bool        regression     = false;
     bool        saveRef        = false;
     bool        headless       = false;
+    bool        multiRes       = false;
     uint32_t    captureEvery   = 50;
     int         scene          = 0;
     std::string replayPath;
@@ -42,6 +43,7 @@ AppConfig parseArgs(int argc, char** argv) {
         else if (!strcmp(argv[i], "--regression"))                   cfg.regression     = true;
         else if (!strcmp(argv[i], "--save-ref"))                     cfg.saveRef        = true;
         else if (!strcmp(argv[i], "--headless"))                     cfg.headless       = true;
+        else if (!strcmp(argv[i], "--multi-res"))                    cfg.multiRes       = true;
         else if (!strcmp(argv[i], "--capture-every") && i+1 < argc) cfg.captureEvery   = std::stoul(argv[++i]);
         else if (!strcmp(argv[i], "--scene")         && i+1 < argc) cfg.scene           = std::stoi(argv[++i]);
         else if (!strcmp(argv[i], "--replay")        && i+1 < argc) cfg.replayPath       = argv[++i];
@@ -102,8 +104,18 @@ int main(int argc, char** argv) {
                 ui = std::make_unique<tgt::DebugUI>(ctx, window->handle(), renderPass.handle(),
                                                      swapchain.imageCount(), renderer.commandPool());
 
+            std::string pendingReplay;  // set by UI replay panel, consumed after drawFrame
+
             if (ui) {
                 ui->setSceneCallback([&](int s) { renderer.setScene(s); });
+                ui->setCapturesDir(path("captures"));
+
+                // Replay triggered from the ImGui panel — deferred to after drawFrame
+                ui->setReplayCallback([&](const std::string& replayFile) {
+                    // Store path; actual replay runs after current drawFrame completes
+                    // (captured by reference; pendingReplay is in the outer scope below)
+                    pendingReplay = replayFile;
+                });
             }
 
             tgt::MetricsCollector metrics;
@@ -121,12 +133,24 @@ int main(int argc, char** argv) {
                         data.cpuFrameMs    = data.fps > 0.0f ? 1000.0f / data.fps : 0.0f;
                         auto& rep          = profiler.lastReport();
                         data.gpuFrameMs    = static_cast<float>(rep.totalGpuMs);
+                        data.jitterMs      = static_cast<float>(rep.jitterMs);
+                        data.syncSuspected = rep.syncSuspected;
+                        data.spikeCount    = static_cast<uint32_t>(profiler.spikes().size());
                         data.vsInvocations = rep.pipelineStats.vertexShaderInvocations;
                         data.fsInvocations = rep.pipelineStats.fragmentShaderInvocations;
                         data.iaPrimitives  = rep.pipelineStats.inputAssemblyPrimitives;
                         data.clippingPrims = rep.pipelineStats.clippingPrimitives;
                         data.drawCalls     = stats.drawCalls;
                         data.pipelineName  = pipeline.name();
+                        // Barrier probe timing
+                        for (auto& pass : rep.passes)
+                            if (pass.name == "barrier")
+                                data.barrierMs = static_cast<float>(pass.gpuTimeMs);
+                        // Per-draw command buffer list for inspector panel
+                        auto& draws = renderer.lastDrawCalls();
+                        for (uint32_t i = 0; i < static_cast<uint32_t>(draws.size()); ++i)
+                            data.drawCallList.push_back({ i, draws[i].pipeline,
+                                                          draws[i].vertexCount, draws[i].indexCount });
                         ui->render(cmd, data);
                     });
             }
@@ -158,13 +182,12 @@ int main(int argc, char** argv) {
                 });
 
             if (!cfg.replayPath.empty()) {
-                // --- Frame replay path ---
+                // --- Frame replay path (CLI --replay) ---
                 tgt::FrameReplayer replayer(ctx, swapchain, renderPass, pipeline,
                                              renderer, regression);
-                bool ok = replayer.replay(cfg.replayPath, renderer.commandPool());
-                if (!ok) {
+                auto result = replayer.replay(cfg.replayPath, renderer.commandPool());
+                if (result.totalPixels == 0)
                     std::cerr << "[Replay] Failed to replay: " << cfg.replayPath << "\n";
-                }
             } else {
                 // --- Normal render loop ---
                 std::cout << "[TegraTrace] Rendering " << cfg.targetFrames << " frames"
@@ -192,13 +215,30 @@ int main(int argc, char** argv) {
 
                     metrics.endFrame(frameNumber, 0.0, 1, 36);
 
+                    // UI-triggered replay (deferred from within-render-pass callback)
+                    if (!pendingReplay.empty()) {
+                        renderer.waitIdle();
+                        tgt::FrameReplayer replayer(ctx, swapchain, renderPass, pipeline,
+                                                     renderer, regression);
+                        auto result = replayer.replay(pendingReplay, renderer.commandPool());
+                        if (ui) ui->setLastReplayResult(result.psnrDb, result.passed);
+                        pendingReplay.clear();
+                    }
+
                     if (cfg.regression && (renderedFrame == 100 || renderedFrame == 400)) {
                         renderer.waitIdle();
                         std::string testName = "frame_" + std::to_string(renderedFrame);
-                        if (cfg.saveRef)
-                            regression.saveReference(testName, renderer.lastImageIndex(), renderer.commandPool());
-                        else
-                            regression.captureAndTest(testName, renderer.lastImageIndex(), renderer.commandPool());
+                        if (cfg.saveRef) {
+                            if (cfg.multiRes)
+                                regression.saveReferenceMultiRes(testName, renderer.lastImageIndex(), renderer.commandPool());
+                            else
+                                regression.saveReference(testName, renderer.lastImageIndex(), renderer.commandPool());
+                        } else {
+                            if (cfg.multiRes)
+                                regression.captureAndTestMultiRes(testName, renderer.lastImageIndex(), renderer.commandPool());
+                            else
+                                regression.captureAndTest(testName, renderer.lastImageIndex(), renderer.commandPool());
+                        }
                     }
                 }
             }

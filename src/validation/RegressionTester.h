@@ -43,10 +43,20 @@ public:
                                    uint32_t swapchainImageIndex,
                                    VkCommandPool cmdPool);
 
+    // Same as captureAndTest but also tests downscaled versions (50% and 25%)
+    void captureAndTestMultiRes(const std::string& testName,
+                                uint32_t swapchainImageIndex,
+                                VkCommandPool cmdPool);
+
     // Save current swapchain image as the new reference for testName
     void saveReference(const std::string& testName,
                        uint32_t swapchainImageIndex,
                        VkCommandPool cmdPool);
+
+    // Save references at native, 50%, and 25% resolution
+    void saveReferenceMultiRes(const std::string& testName,
+                               uint32_t swapchainImageIndex,
+                               VkCommandPool cmdPool);
 
     const RegressionReport& report() const { return m_report; }
     void exportReport(const std::string& path) const;

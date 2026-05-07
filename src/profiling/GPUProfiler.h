@@ -25,7 +25,9 @@ struct PipelineStats {
 };
 
 struct FrameGPUReport {
-    double        totalGpuMs = 0.0;
+    double        totalGpuMs    = 0.0;
+    double        jitterMs      = 0.0;   // deviation from rolling mean (sync stall indicator)
+    bool          syncSuspected = false; // true when jitter > 50% of mean GPU time
     std::vector<PassTiming> passes;
     PipelineStats pipelineStats;
 };
