@@ -23,7 +23,7 @@
 namespace fs = std::filesystem;
 
 struct AppConfig {
-    uint32_t    targetFrames   = 500;
+    uint32_t    targetFrames   = UINT32_MAX;
     bool        captureEnabled = false;
     bool        regression     = false;
     bool        saveRef        = false;
@@ -150,13 +150,31 @@ int main(int argc, char** argv) {
                                               path("references"), path("reports"));
 
             uint32_t frameNumber = 0;
+            float    realCpuFrameMs = 0.0f;
+            auto     lastFrameStart = std::chrono::high_resolution_clock::now();
+
+            // Orbit camera state for scene 3 (mouse drag + scroll)
+            struct OrbitState {
+                float azimuth   = 0.0f;
+                float elevation = 0.25f;
+                float radius    = 2.5f;
+                double lastX = 0, lastY = 0;
+                bool   dragging = false;
+                bool   userMoved = false;
+            } orbit;
+
+            // Scroll callback — stored in a static so the non-capturing lambda can write it
+            static float s_scrollDelta = 0.0f;
+            if (window)
+                glfwSetScrollCallback(window->handle(),
+                    [](GLFWwindow*, double, double dy) { s_scrollDelta += (float)dy; });
 
             if (!cfg.headless) {
                 renderer.setFrameCallback(
                     [&](uint32_t /*frame*/, VkCommandBuffer cmd, tgt::FrameDrawStats& stats) {
                         tgt::UIFrameData data;
                         data.fps           = static_cast<float>(metrics.currentFPS());
-                        data.cpuFrameMs    = data.fps > 0.0f ? 1000.0f / data.fps : 0.0f;
+                        data.cpuFrameMs    = realCpuFrameMs;
                         auto& rep          = profiler.lastReport();
                         data.gpuFrameMs    = static_cast<float>(rep.totalGpuMs);
                         data.jitterMs      = static_cast<float>(rep.jitterMs);
@@ -166,12 +184,27 @@ int main(int argc, char** argv) {
                         data.fsInvocations = rep.pipelineStats.fragmentShaderInvocations;
                         data.iaPrimitives  = rep.pipelineStats.inputAssemblyPrimitives;
                         data.clippingPrims = rep.pipelineStats.clippingPrimitives;
-                        data.drawCalls     = stats.drawCalls;
-                        data.pipelineName  = pipeline.name();
-                        // Barrier probe timing
-                        for (auto& pass : rep.passes)
-                            if (pass.name == "barrier")
+                        data.drawCalls    = stats.drawCalls;
+                        {
+                            uint64_t pixels = (uint64_t)swapchain.extent().width * swapchain.extent().height;
+                            data.overdrawRatio = (pixels > 0 && rep.pipelineStats.fragmentShaderInvocations > 0)
+                                ? static_cast<float>(rep.pipelineStats.fragmentShaderInvocations) / static_cast<float>(pixels)
+                                : 0.0f;
+                        }
+                        data.pipelineName = (cfg.scene == 3) ? pbrPipeline.name()
+                                          : (cfg.scene == 2) ? meshPipeline.name()
+                                          : pipeline.name();
+                        // Per-pass breakdown
+                        for (auto& pass : rep.passes) {
+                            if (pass.name == "barrier") {
                                 data.barrierMs = static_cast<float>(pass.gpuTimeMs);
+                            } else if (pass.name.size() > 4 && pass.name.substr(0, 4) == "sub:") {
+                                tgt::UIFrameData::SubmeshTiming st;
+                                st.name  = pass.name;
+                                st.gpuMs = static_cast<float>(pass.gpuTimeMs);
+                                data.submeshTimings.push_back(st);
+                            }
+                        }
                         // Per-draw command buffer list for inspector panel
                         auto& draws = renderer.lastDrawCalls();
                         for (uint32_t i = 0; i < static_cast<uint32_t>(draws.size()); ++i)
@@ -230,9 +263,47 @@ int main(int argc, char** argv) {
                         }
                     }
 
+                    {
+                        auto now = std::chrono::high_resolution_clock::now();
+                        realCpuFrameMs = std::chrono::duration<float, std::milli>(now - lastFrameStart).count();
+                        lastFrameStart = now;
+                    }
+
                     ctx.setCurrentFrame(frameNumber);
                     metrics.beginFrame();
                     if (!cfg.headless) ui->newFrame();
+
+                    // Scene 3 orbit camera input
+                    if (cfg.scene == 3 && window) {
+                        GLFWwindow* win = window->handle();
+                        double mx, my;
+                        glfwGetCursorPos(win, &mx, &my);
+
+                        if (glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+                            if (!orbit.dragging) {
+                                orbit.lastX = mx; orbit.lastY = my;
+                                orbit.dragging = true;
+                            }
+                            float dx = static_cast<float>(mx - orbit.lastX) * 0.007f;
+                            float dy = static_cast<float>(my - orbit.lastY) * 0.007f;
+                            orbit.azimuth   += dx;
+                            orbit.elevation  = std::clamp(orbit.elevation - dy, -1.4f, 1.4f);
+                            orbit.lastX = mx; orbit.lastY = my;
+                            orbit.userMoved = true;
+                        } else {
+                            orbit.dragging = false;
+                        }
+
+                        // Scroll to zoom
+                        orbit.radius = std::clamp(orbit.radius - s_scrollDelta * 0.15f, 0.3f, 8.0f);
+                        s_scrollDelta = 0.0f;
+
+                        // Auto-rotate until user first drags
+                        if (!orbit.userMoved)
+                            orbit.azimuth += 0.004f;
+
+                        renderer.setOrbitCamera(orbit.azimuth, orbit.elevation, orbit.radius);
+                    }
 
                     uint32_t renderedFrame = frameNumber;
                     bool ok = renderer.drawFrame(frameNumber);

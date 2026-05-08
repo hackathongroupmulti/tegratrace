@@ -90,6 +90,7 @@ void DebugUI::buildPanels(const UIFrameData& data) {
 
     // Right column (x=330)
     panelCommandBufferInspector(data);
+    panelSubmeshTimings(data);
     panelReplayControls();
 }
 
@@ -123,13 +124,16 @@ void DebugUI::panelFrameTiming(const UIFrameData& data) {
 
 void DebugUI::panelPipelineStats(const UIFrameData& data) {
     ImGui::SetNextWindowPos({10, 275}, ImGuiCond_Once);
-    ImGui::SetNextWindowSize({310, 130}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 145}, ImGuiCond_Once);
     ImGui::Begin("Pipeline Statistics");
     ImGui::Text("Draw calls       %u",   data.drawCalls);
     ImGui::Text("VS invocations   %llu", (unsigned long long)data.vsInvocations);
     ImGui::Text("FS invocations   %llu", (unsigned long long)data.fsInvocations);
     ImGui::Text("IA primitives    %llu", (unsigned long long)data.iaPrimitives);
     ImGui::Text("Clip primitives  %llu", (unsigned long long)data.clippingPrims);
+    ImGui::Separator();
+    if (data.overdrawRatio >= 0.0f)
+        ImGui::Text("Overdraw ratio   %.2fx", data.overdrawRatio);
     ImGui::End();
 }
 
@@ -204,8 +208,32 @@ void DebugUI::panelCommandBufferInspector(const UIFrameData& data) {
     ImGui::End();
 }
 
-void DebugUI::panelReplayControls() {
+void DebugUI::panelSubmeshTimings(const UIFrameData& data) {
+    if (data.submeshTimings.empty()) return;
+
     ImGui::SetNextWindowPos({330, 220}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 200}, ImGuiCond_Once);
+    ImGui::Begin("Submesh GPU Timings");
+
+    // Find max for bar scaling
+    float maxMs = 0.001f;
+    for (auto& t : data.submeshTimings)
+        maxMs = std::max(maxMs, t.gpuMs);
+
+    for (auto& t : data.submeshTimings) {
+        const char* label = t.name.c_str();
+        if (t.name.size() > 4 && t.name.substr(0, 4) == "sub:") label += 4;
+
+        // Name and timing both in the overlay so bars can fill the full width
+        char overlay[64];
+        std::snprintf(overlay, sizeof(overlay), "%s  %.4f ms", label, t.gpuMs);
+        ImGui::ProgressBar(t.gpuMs / maxMs, {-1, 16}, overlay);
+    }
+    ImGui::End();
+}
+
+void DebugUI::panelReplayControls() {
+    ImGui::SetNextWindowPos({330, 430}, ImGuiCond_Once);
     ImGui::SetNextWindowSize({310, 200}, ImGuiCond_Once);
     ImGui::Begin("Replay Controls");
 

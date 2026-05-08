@@ -9,6 +9,7 @@
 #include <stb_image.h>
 
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
@@ -37,6 +38,7 @@ PBRModel::~PBRModel() {
     m_uboBuffers.clear();
 
     destroyMaterials();
+    destroyTextureCache();
     m_submeshes.clear();
 
     // Fallback textures
@@ -52,23 +54,25 @@ PBRModel::~PBRModel() {
 }
 
 void PBRModel::destroyMaterials() {
-    for (auto& mat : m_materials) {
-        for (int i = 0; i < kPBRTexCount; ++i) {
-            if (mat.views[i])    vkDestroyImageView(m_ctx.device(), mat.views[i], nullptr);
-            if (mat.images[i])   vkDestroyImage(m_ctx.device(), mat.images[i], nullptr);
-            if (mat.memories[i]) vkFreeMemory(m_ctx.device(), mat.memories[i], nullptr);
-        }
+    m_materials.clear();  // views are borrowed from m_texCache; cache owns the GPU objects
+}
+
+void PBRModel::destroyTextureCache() {
+    for (auto& [path, tex] : m_texCache) {
+        if (tex.view)   vkDestroyImageView(m_ctx.device(), tex.view, nullptr);
+        if (tex.image)  vkDestroyImage(m_ctx.device(), tex.image, nullptr);
+        if (tex.memory) vkFreeMemory(m_ctx.device(), tex.memory, nullptr);
     }
-    m_materials.clear();
+    m_texCache.clear();
 }
 
 // ---------------------------------------------------------------------------
 // Small helper: upload a 1×1 RGBA8 pixel to a new device-local image
 // ---------------------------------------------------------------------------
 static VkImageView makeSmallTexture(VulkanContext& ctx, VkCommandPool pool,
-                                    uint8_t r, uint8_t g, uint8_t b, uint8_t a,
+                                    uint8_t pr, uint8_t pg, uint8_t pb, uint8_t pa,
                                     VkImage& outImg, VkDeviceMemory& outMem) {
-    uint8_t pixels[4] = { r, g, b, a };
+    uint8_t pixels[4] = { pr, pg, pb, pa };
 
     Buffer staging(ctx, 4,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -100,17 +104,17 @@ static VkImageView makeSmallTexture(VulkanContext& ctx, VkCommandPool pool,
 
     auto cmd = ctx.beginSingleTimeCommands(pool);
     {
-        VkImageMemoryBarrier b{};
-        b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
-        b.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image               = outImg;
-        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        b.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        VkImageMemoryBarrier barrier{};
+        barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image               = outImg;
+        barrier.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        barrier.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,nullptr,0,nullptr,1,&b);
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,nullptr,0,nullptr,1,&barrier);
     }
     VkBufferImageCopy region{};
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -118,18 +122,18 @@ static VkImageView makeSmallTexture(VulkanContext& ctx, VkCommandPool pool,
     vkCmdCopyBufferToImage(cmd, staging.handle(), outImg,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     {
-        VkImageMemoryBarrier b{};
-        b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image               = outImg;
-        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        b.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
-        b.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        VkImageMemoryBarrier barrier{};
+        barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image               = outImg;
+        barrier.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        barrier.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,nullptr,0,nullptr,1,&b);
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,nullptr,0,nullptr,1,&barrier);
     }
     ctx.endSingleTimeCommands(pool, cmd);
 
@@ -362,6 +366,9 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
             aiTextureType_AMBIENT_OCCLUSION, aiTextureType_UNKNOWN
         };
 
+        // Track resolved paths that fill a slot — used below for base-name inference
+        std::vector<std::string> slotPaths(kPBRTexCount);
+
         for (aiTextureType type : kAllTypes) {
             unsigned count = aiMat->GetTextureCount(type);
             for (unsigned ti = 0; ti < count; ++ti) {
@@ -397,14 +404,93 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
                 if (m_materials[mi].hasMap[slot]) continue; // first match wins
 
                 bool srgb = (slot == kPBRAlbedo);
-                VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
-                VkImageView view = loadTextureFile(resolved, srgb, img, mem, pool);
-                if (view != VK_NULL_HANDLE) {
-                    m_materials[mi].images[slot]   = img;
-                    m_materials[mi].memories[slot] = mem;
-                    m_materials[mi].views[slot]    = view;
-                    m_materials[mi].hasMap[slot]   = true;
+
+                // Check cache: same file used by multiple materials shares one VkImage
+                VkImageView view = VK_NULL_HANDLE;
+                auto cacheIt = m_texCache.find(resolved);
+                if (cacheIt != m_texCache.end()) {
+                    view = cacheIt->second.view;
+                } else {
+                    VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
+                    view = loadTextureFile(resolved, srgb, img, mem, pool);
+                    if (view != VK_NULL_HANDLE)
+                        m_texCache[resolved] = { img, mem, view };
                 }
+
+                if (view != VK_NULL_HANDLE) {
+                    m_materials[mi].views[slot]  = view;
+                    m_materials[mi].hasMap[slot] = true;
+                    slotPaths[slot]              = resolved;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Fill missing slots by inferring base name from already-loaded textures.
+        // The FBX may only reference a subset of available texture files (common in
+        // XPS exports). For each empty slot, strip the suffix from any loaded texture
+        // path to get a base (e.g. "Leon_Hair_N.png" → "Leon_Hair"), then probe for
+        // the expected file (e.g. "Leon_Hair_D.png") in the FBX directory.
+        // -----------------------------------------------------------------------
+        static const char* kStripSuffixes[] = {
+            "_N", "_AO", "_R", "_M", "_S", "_D", "_D-cut", "_ATOC", nullptr
+        };
+        struct SlotProbe {
+            int         slot;
+            const char* suffixes[4];  // candidates in priority order, null-terminated
+            bool        srgb;
+        };
+        static const SlotProbe kProbes[] = {
+            { kPBRAlbedo,    {"_D.png",  "_D.tga",  "_D-cut.png", "_ATOC.tga"}, true  },
+            { kPBRRoughness, {"_R.png",  "_R.tga",  nullptr,      nullptr     }, false },
+            { kPBRMetallic,  {"_M.png",  "_M.tga",  nullptr,      nullptr     }, false },
+            { kPBRAO,        {"_AO.png", "_AO.tga", nullptr,      nullptr     }, false },
+            { kPBRNormal,    {"_N.png",  "_N.tga",  nullptr,      nullptr     }, false },
+        };
+
+        // Collect candidate base names from loaded texture stems
+        std::vector<std::string> bases;
+        for (int t = 0; t < kPBRTexCount; ++t) {
+            if (slotPaths[t].empty()) continue;
+            std::string stem = fs::path(slotPaths[t]).stem().string();  // e.g. "Leon_Hair_N"
+            for (const char** s = kStripSuffixes; *s; ++s) {
+                std::string suf(*s);
+                if (stem.size() > suf.size() &&
+                    stem.substr(stem.size() - suf.size()) == suf) {
+                    std::string base = stem.substr(0, stem.size() - suf.size());
+                    // Skip overly-generic bases (e.g. "Gen", "hair")
+                    if (base.size() >= 4)
+                        bases.push_back(base);
+                    break;
+                }
+            }
+        }
+
+        for (auto& probe : kProbes) {
+            if (m_materials[mi].hasMap[probe.slot]) continue;
+            for (auto& base : bases) {
+                bool found = false;
+                for (int ci = 0; probe.suffixes[ci] && !found; ++ci) {
+                    std::string candidate = m_dir + "/" + base + probe.suffixes[ci];
+                    if (!fs::exists(candidate)) continue;
+
+                    VkImageView view = VK_NULL_HANDLE;
+                    auto cacheIt = m_texCache.find(candidate);
+                    if (cacheIt != m_texCache.end()) {
+                        view = cacheIt->second.view;
+                    } else {
+                        VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
+                        view = loadTextureFile(candidate, probe.srgb, img, mem, pool);
+                        if (view != VK_NULL_HANDLE)
+                            m_texCache[candidate] = { img, mem, view };
+                    }
+                    if (view != VK_NULL_HANDLE) {
+                        m_materials[mi].views[probe.slot]  = view;
+                        m_materials[mi].hasMap[probe.slot] = true;
+                        found = true;
+                    }
+                }
+                if (m_materials[mi].hasMap[probe.slot]) break;
             }
         }
     }

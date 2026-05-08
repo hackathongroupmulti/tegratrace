@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <array>
+#include <unordered_map>
 
 namespace tgt {
 
@@ -28,11 +29,9 @@ struct PBRUBOData {
 };                        // total  176 bytes
 
 struct PBRMaterial {
-    std::string    name;
-    VkImage        images[kPBRTexCount]    = {};
-    VkDeviceMemory memories[kPBRTexCount]  = {};
-    VkImageView    views[kPBRTexCount]     = {};
-    bool           hasMap[kPBRTexCount]    = {};
+    std::string name;
+    VkImageView views[kPBRTexCount]  = {};   // borrowed from PBRModel::m_texCache
+    bool        hasMap[kPBRTexCount] = {};
 };
 
 struct PBRSubmesh {
@@ -80,6 +79,15 @@ private:
     std::string resolveTexPath(const std::string& rawPath) const;
 
     void destroyMaterials();
+    void destroyTextureCache();
+
+    // Texture cache: resolved absolute path → GPU objects (shared across materials)
+    struct CachedTexture {
+        VkImage        image  = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView    view   = VK_NULL_HANDLE;
+    };
+    std::unordered_map<std::string, CachedTexture> m_texCache;
 
     VulkanContext& m_ctx;
     std::string    m_dir;  // directory of the loaded FBX

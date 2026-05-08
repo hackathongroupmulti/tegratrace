@@ -91,6 +91,9 @@ public:
     // Scene 3: PBR model (FBX via Assimp)
     void loadPBRModel(const std::string& fbxPath);
     void setPBRPipeline(Pipeline* p) { m_pbrPipeline = p; }
+    void setOrbitCamera(float azimuth, float elevation, float radius) {
+        m_orbitAzimuth = azimuth; m_orbitElevation = elevation; m_orbitRadius = radius;
+    }
 
     VkCommandPool commandPool()     const { return m_commandPool; }
     uint32_t      lastImageIndex()  const { return m_lastImageIndex; }
@@ -151,6 +154,9 @@ private:
     std::unique_ptr<PBRModel> m_pbrModel;
     Pipeline*                 m_pbrPipeline = nullptr;
     float                     m_pbrCameraPos[3] = { 0.0f, 1.5f, 3.0f };
+    float m_orbitAzimuth   = 0.0f;
+    float m_orbitElevation = 0.25f;
+    float m_orbitRadius    = 2.5f;
 
     uint32_t m_lastImageIndex  = 0;
     uint32_t m_frameCount      = 0;

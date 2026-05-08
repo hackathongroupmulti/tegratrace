@@ -407,10 +407,13 @@ void Renderer::updateUniformBuffer(uint32_t frame, uint32_t frameNumber) {
 
         glm::mat4 view;
         if (m_scene == 3) {
-            // Orbit camera for PBR model: slow horizontal circle at eye level
-            float t   = frameNumber * 0.004f;
-            glm::vec3 eye = { 2.5f * std::sin(t), 1.5f, 2.5f * std::cos(t) };
-            glm::vec3 at  = { 0.0f, 0.9f, 0.0f };
+            float cosEl = std::cos(m_orbitElevation);
+            glm::vec3 eye = {
+                m_orbitRadius * cosEl * std::sin(m_orbitAzimuth),
+                m_orbitRadius * std::sin(m_orbitElevation),
+                m_orbitRadius * cosEl * std::cos(m_orbitAzimuth)
+            };
+            glm::vec3 at = { 0.0f, 0.9f, 0.0f };
             view = glm::lookAt(eye, at, { 0.0f, 1.0f, 0.0f });
             m_pbrCameraPos[0] = eye.x;
             m_pbrCameraPos[1] = eye.y;
@@ -453,8 +456,9 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     clearValues[1].depthStencil = {1.0f, 0};
 
     uint32_t profIdx = frameIdx % Swapchain::kMaxFramesInFlight;
+    const bool isPBRScene = (m_scene == 3) && m_pbrModel && m_pbrModel->isLoaded() && m_pbrPipeline;
     if (m_profiler) {
-        m_profiler->beginPass(cmd, profIdx, "main");
+        if (!isPBRScene) m_profiler->beginPass(cmd, profIdx, "main");
         m_profiler->beginPipelineStats(cmd, profIdx);
     }
 
@@ -535,17 +539,20 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     }
 
     // ---- Scene 3: PBR multi-submesh model ----
-    const bool isPBRScene = (m_scene == 3) && m_pbrModel && m_pbrModel->isLoaded() && m_pbrPipeline;
     if (isPBRScene) {
         m_lastDrawCalls.clear();
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pbrPipeline->handle());
 
-        // Scale model to metric units (XPS/RE engine uses centimetres → multiply by 0.01)
+        // XPS FBX is Z-up, centimetre units → rotate -90° on X, scale to metres
         glm::mat4 modelMat = glm::scale(glm::mat4(1.0f), glm::vec3(0.01f));
+        modelMat = glm::rotate(modelMat, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
 
         uint32_t fi = frameIdx % Swapchain::kMaxFramesInFlight;
         for (int s = 0; s < static_cast<int>(m_pbrModel->submeshes().size()); ++s) {
             const auto& sub = m_pbrModel->submeshes()[s];
+
+            std::string passName = "sub:" + (sub.name.empty() ? std::to_string(s) : sub.name);
+            if (m_profiler) m_profiler->beginPass(cmd, profIdx, passName);
 
             VkDescriptorSet ds = m_pbrModel->descriptorSet(s, fi);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -559,6 +566,8 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
             vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &offset);
             vkCmdBindIndexBuffer(cmd, sub.indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, sub.indexCount, 1, 0, 0, 0);
+
+            if (m_profiler) m_profiler->endPass(cmd, profIdx);
 
             stats.drawCalls++;
             stats.indexCount += sub.indexCount;
@@ -586,7 +595,6 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
         if (m_frameCallback) m_frameCallback(frameNumber, cmd, stats);
         vkCmdEndRenderPass(cmd);
 
-        if (m_profiler) m_profiler->endPass(cmd, profIdx);  // end "main"
         if (m_profiler) m_profiler->beginPass(cmd, profIdx, "barrier");
         {
             VkMemoryBarrier mb{};

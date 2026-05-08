@@ -121,20 +121,22 @@ FrameGPUReport GPUProfiler::readResults(uint32_t frameIdx) {
 
             m_passHistory[pt.name].push_back(ms);
 
-            // Spike detection: if we have >= 100 samples, check if current > p99 * 1.5
+            // Spike detection: only on meaningful passes (>= 0.05 ms baseline)
+            // Skips tiny barrier/probe passes which have too much relative variance.
             auto& history = m_passHistory[pt.name];
-            if (history.size() >= 100) {
+            if (ms >= 0.05 && history.size() >= 100) {
                 std::vector<double> sorted(history.begin(), history.end());
                 std::sort(sorted.begin(), sorted.end());
                 double p99 = sorted[sorted.size() * 99 / 100];
-                if (ms > p99 * 1.5) {
+                if (p99 >= 0.05 && ms > p99 * 1.5) {
                     FrameSpike spike{};
                     spike.frameSlot = frameIdx;
                     spike.gpuMs     = ms;
                     spike.p99Ms     = p99;
                     m_spikes.push_back(spike);
-                    std::cerr << "[GPUProfiler] Spike detected on pass '" << pt.name
-                              << "': " << ms << " ms > p99*1.5=" << (p99 * 1.5) << " ms\n";
+                    // Rolling window: keep only last 200 spikes
+                    if (m_spikes.size() > 200)
+                        m_spikes.erase(m_spikes.begin(), m_spikes.begin() + 100);
                 }
             }
         }

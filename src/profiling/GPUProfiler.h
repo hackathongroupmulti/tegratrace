@@ -40,7 +40,7 @@ struct FrameSpike {
 
 class GPUProfiler {
 public:
-    static constexpr uint32_t kMaxPasses = 8;
+    static constexpr uint32_t kMaxPasses = 64;
 
     GPUProfiler(VulkanContext& ctx, uint32_t framesInFlight);
     ~GPUProfiler();

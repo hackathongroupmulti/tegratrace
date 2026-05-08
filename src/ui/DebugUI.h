@@ -33,8 +33,13 @@ struct UIFrameData {
     uint64_t    fsInvocations   = 0;
     uint64_t    iaPrimitives    = 0;
     uint64_t    clippingPrims   = 0;
+    float       overdrawRatio   = 0.0f;  // fsInvocations / viewport pixels
     std::string pipelineName;
     std::vector<DrawCallSummary> drawCallList;  // submission-order draw list
+
+    // Per-submesh GPU timings (scene 3 only)
+    struct SubmeshTiming { std::string name; float gpuMs = 0.0f; };
+    std::vector<SubmeshTiming> submeshTimings;
 };
 
 class DebugUI {
@@ -69,6 +74,7 @@ private:
     void panelSceneControl();
     void panelCommandBufferInspector(const UIFrameData& data);
     void panelReplayControls();
+    void panelSubmeshTimings(const UIFrameData& data);
     void scanCaptureFiles();
 
     VulkanContext&   m_ctx;
