@@ -37,4 +37,16 @@ struct Vertex {
     static std::vector<VkVertexInputAttributeDescription> attributeDescriptions();
 };
 
+// Vertex layout used by the PBR pipeline (no vertex colour, adds normal/tangent/bitangent)
+struct PBRVertex {
+    float pos[3];
+    float normal[3];
+    float uv[2];
+    float tangent[3];
+    float bitangent[3];
+
+    static VkVertexInputBindingDescription   bindingDescription();
+    static std::vector<VkVertexInputAttributeDescription> attributeDescriptions();
+};
+
 } // namespace tgt

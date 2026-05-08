@@ -32,6 +32,8 @@ struct AppConfig {
     uint32_t    captureEvery   = 50;
     int         scene          = 0;
     std::string replayPath;
+    std::string meshPath;
+    std::string fbxPath;
     std::string exeDir         = ".";
 };
 
@@ -47,7 +49,12 @@ AppConfig parseArgs(int argc, char** argv) {
         else if (!strcmp(argv[i], "--capture-every") && i+1 < argc) cfg.captureEvery   = std::stoul(argv[++i]);
         else if (!strcmp(argv[i], "--scene")         && i+1 < argc) cfg.scene           = std::stoi(argv[++i]);
         else if (!strcmp(argv[i], "--replay")        && i+1 < argc) cfg.replayPath       = argv[++i];
+        else if (!strcmp(argv[i], "--mesh")          && i+1 < argc) cfg.meshPath         = argv[++i];
+        else if (!strcmp(argv[i], "--fbx")           && i+1 < argc) cfg.fbxPath          = argv[++i];
     }
+    // --mesh implies --scene 2; --fbx implies --scene 3
+    if (!cfg.meshPath.empty()) cfg.scene = 2;
+    if (!cfg.fbxPath.empty())  cfg.scene = 3;
     return cfg;
 }
 
@@ -92,9 +99,28 @@ int main(int argc, char** argv) {
             pipelineCfg.vertSpvPath = path("shaders/triangle.vert.spv");
             pipelineCfg.fragSpvPath = path("shaders/triangle.frag.spv");
 
+            tgt::PipelineConfig meshCfg{};
+            meshCfg.vertSpvPath = path("shaders/mesh.vert.spv");
+            meshCfg.fragSpvPath = path("shaders/mesh.frag.spv");
+
+            // PBR pipeline: Cook-Torrance + 5 texture maps, PBRVertex layout, double-sided
+            tgt::PipelineConfig pbrCfg{};
+            pbrCfg.vertSpvPath          = path("shaders/pbr.vert.spv");
+            pbrCfg.fragSpvPath          = path("shaders/pbr.frag.spv");
+            pbrCfg.textureBindingCount  = 5;  // albedo, normal, roughness, metallic, AO
+            pbrCfg.usePBRVertex         = true;
+            pbrCfg.cullMode             = VK_CULL_MODE_NONE; // double-sided for hair/cloth
+
             tgt::Pipeline    pipeline(ctx, renderPass, swapchain.extent(), pipelineCfg);
+            tgt::Pipeline    meshPipeline(ctx, renderPass, swapchain.extent(), meshCfg);
+            tgt::Pipeline    pbrPipeline(ctx, renderPass, swapchain.extent(), pbrCfg);
             tgt::Renderer    renderer(ctx, swapchain, renderPass, pipeline);
             renderer.setScene(cfg.scene);
+            renderer.setMeshPipeline(&meshPipeline);
+            renderer.setPBRPipeline(&pbrPipeline);
+            renderer.loadMesh(cfg.meshPath);  // always loads sphere; OBJ if --mesh given
+            if (!cfg.fbxPath.empty())
+                renderer.loadPBRModel(cfg.fbxPath);
 
             tgt::GPUProfiler      profiler(ctx, tgt::Swapchain::kMaxFramesInFlight);
             renderer.setProfiler(&profiler);
@@ -213,7 +239,8 @@ int main(int argc, char** argv) {
                     frameNumber++;
                     if (!ok) continue;
 
-                    metrics.endFrame(frameNumber, 0.0, 1, 36);
+                    { auto& fs = renderer.lastFrameStats();
+                      metrics.endFrame(frameNumber, 0.0, fs.drawCalls, fs.indexCount); }
 
                     // UI-triggered replay (deferred from within-render-pass callback)
                     if (!pendingReplay.empty()) {

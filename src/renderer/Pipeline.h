@@ -15,6 +15,10 @@ struct PipelineConfig {
     VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT;
     VkPolygonMode   polyMode = VK_POLYGON_MODE_FILL;
     bool        enableStats  = true;
+    // Number of combined-image-sampler bindings (slots 1..textureBindingCount)
+    uint32_t    textureBindingCount = 1;
+    // Use PBRVertex input layout instead of the default Vertex layout
+    bool        usePBRVertex = false;
 };
 
 class Pipeline {

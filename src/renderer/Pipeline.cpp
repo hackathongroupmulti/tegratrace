@@ -4,6 +4,7 @@
 #include "RenderPass.h"
 #include "core/VulkanContext.h"
 #include <array>
+#include <vector>
 #include <stdexcept>
 #include <filesystem>
 
@@ -18,21 +19,25 @@ Pipeline::Pipeline(VulkanContext& ctx, RenderPass& renderPass,
       m_vertSpvPath(cfg.vertSpvPath),
       m_fragSpvPath(cfg.fragSpvPath)
 {
-    // Binding 0: UBO (view+proj, vertex stage)
+    // Binding 0: UBO (vertex + fragment stages for PBR; vertex-only for legacy)
     VkDescriptorSetLayoutBinding uboBinding{};
     uboBinding.binding         = 0;
     uboBinding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     uboBinding.descriptorCount = 1;
-    uboBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
+    uboBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    // Binding 1: texture sampler (fragment stage)
-    VkDescriptorSetLayoutBinding samplerBinding{};
-    samplerBinding.binding         = 1;
-    samplerBinding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    samplerBinding.descriptorCount = 1;
-    samplerBinding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Bindings 1..textureBindingCount: combined-image-samplers (fragment stage)
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    bindings.push_back(uboBinding);
+    for (uint32_t t = 0; t < cfg.textureBindingCount; ++t) {
+        VkDescriptorSetLayoutBinding sb{};
+        sb.binding         = t + 1;
+        sb.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sb.descriptorCount = 1;
+        sb.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings.push_back(sb);
+    }
 
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboBinding, samplerBinding };
     VkDescriptorSetLayoutCreateInfo dlci{};
     dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dlci.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -65,8 +70,15 @@ Pipeline::Pipeline(VulkanContext& ctx, RenderPass& renderPass,
     stages[1].module = frag.module();
     stages[1].pName  = "main";
 
-    auto binding = Vertex::bindingDescription();
-    auto attribs = Vertex::attributeDescriptions();
+    VkVertexInputBindingDescription binding;
+    std::vector<VkVertexInputAttributeDescription> attribs;
+    if (cfg.usePBRVertex) {
+        binding = PBRVertex::bindingDescription();
+        attribs = PBRVertex::attributeDescriptions();
+    } else {
+        binding = Vertex::bindingDescription();
+        attribs = Vertex::attributeDescriptions();
+    }
     VkPipelineVertexInputStateCreateInfo vis{};
     vis.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vis.vertexBindingDescriptionCount   = 1;

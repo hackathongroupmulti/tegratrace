@@ -67,4 +67,18 @@ std::vector<VkVertexInputAttributeDescription> Vertex::attributeDescriptions() {
     };
 }
 
+VkVertexInputBindingDescription PBRVertex::bindingDescription() {
+    return { 0, sizeof(PBRVertex), VK_VERTEX_INPUT_RATE_VERTEX };
+}
+
+std::vector<VkVertexInputAttributeDescription> PBRVertex::attributeDescriptions() {
+    return {
+        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PBRVertex, pos)       },
+        { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PBRVertex, normal)    },
+        { 2, 0, VK_FORMAT_R32G32_SFLOAT,    offsetof(PBRVertex, uv)        },
+        { 3, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PBRVertex, tangent)   },
+        { 4, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PBRVertex, bitangent) },
+    };
+}
+
 } // namespace tgt

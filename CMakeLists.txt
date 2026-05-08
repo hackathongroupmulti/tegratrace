@@ -47,6 +47,37 @@ FetchContent_Declare(imgui
 )
 FetchContent_MakeAvailable(imgui)
 
+FetchContent_Declare(tinyobjloader
+    GIT_REPOSITORY https://github.com/tinyobjloader/tinyobjloader.git
+    GIT_TAG        v1.0.6
+    GIT_SHALLOW    TRUE
+)
+# Fetch source only — don't process its CMakeLists.txt (cmake_minimum_required too old)
+FetchContent_GetProperties(tinyobjloader)
+if(NOT tinyobjloader_POPULATED)
+    FetchContent_Populate(tinyobjloader)
+endif()
+
+# ---- Assimp (FBX loader for PBR model) ----
+# Disable everything except the FBX and OBJ importers to keep build time short
+set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_FBX_IMPORTER  ON  CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_OBJ_IMPORTER  ON  CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_NO_EXPORT           ON  CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_TESTS         OFF CACHE BOOL "" FORCE)
+set(ASSIMP_INSTALL             OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS  OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES       OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_DOCS          OFF CACHE BOOL "" FORCE)
+set(ASSIMP_WARNINGS_AS_ERRORS  OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(assimp
+    GIT_REPOSITORY https://github.com/assimp/assimp.git
+    GIT_TAG        v5.4.3
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(assimp)
+
 # ---- Shader compilation ----
 find_program(GLSLC glslc HINTS $ENV{VULKAN_SDK}/bin)
 
@@ -80,6 +111,8 @@ set(SOURCES
     src/validation/RegressionTester.cpp
     src/metrics/MetricsCollector.cpp
     src/external/stb_impl.cpp
+    src/external/tinyobj_impl.cpp
+    src/renderer/PBRModel.cpp
     src/ui/DebugUI.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -96,6 +129,7 @@ target_include_directories(tegratrace PRIVATE
     ${stb_SOURCE_DIR}
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
+    ${tinyobjloader_SOURCE_DIR}
 )
 
 target_link_libraries(tegratrace PRIVATE
@@ -103,6 +137,7 @@ target_link_libraries(tegratrace PRIVATE
     glfw
     glm::glm
     nlohmann_json::nlohmann_json
+    assimp::assimp
 )
 
 if(GLSLC)
@@ -111,6 +146,8 @@ if(GLSLC)
     compile_shader(tegratrace shaders/mesh.vert)
     compile_shader(tegratrace shaders/mesh.frag)
     compile_shader(tegratrace shaders/cube_field.vert)
+    compile_shader(tegratrace shaders/pbr.vert)
+    compile_shader(tegratrace shaders/pbr.frag)
     add_custom_command(TARGET tegratrace POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_BINARY_DIR}/shaders"

@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <array>
+#include <cmath>
 
 namespace tgt {
 
@@ -14,6 +15,7 @@ class RenderPass;
 class Pipeline;
 class Buffer;
 class GPUProfiler;
+class PBRModel;
 
 struct FrameDrawStats {
     uint32_t drawCalls    = 0;
@@ -80,7 +82,15 @@ public:
     void setReplayData(const ReplayFrameData* d)  { m_replayData = d; }
 
     // Returns the draw call records from the most recently completed frame
-    const std::vector<DrawCallRecord>& lastDrawCalls() const { return m_lastDrawCalls; }
+    const std::vector<DrawCallRecord>& lastDrawCalls()  const { return m_lastDrawCalls; }
+    const FrameDrawStats&              lastFrameStats()  const { return m_lastFrameStats; }
+
+    void loadMesh(const std::string& objPath = "");
+    void setMeshPipeline(Pipeline* p) { m_meshPipeline = p; }
+
+    // Scene 3: PBR model (FBX via Assimp)
+    void loadPBRModel(const std::string& fbxPath);
+    void setPBRPipeline(Pipeline* p) { m_pbrPipeline = p; }
 
     VkCommandPool commandPool()     const { return m_commandPool; }
     uint32_t      lastImageIndex()  const { return m_lastImageIndex; }
@@ -129,6 +139,18 @@ private:
     float    m_currentProj[16]{};
 
     std::vector<DrawCallRecord> m_lastDrawCalls;
+    FrameDrawStats              m_lastFrameStats{};
+
+    // Scene 2: external mesh geometry
+    std::unique_ptr<Buffer> m_meshVertexBuffer;
+    std::unique_ptr<Buffer> m_meshIndexBuffer;
+    uint32_t                m_meshIndexCount = 0;
+    Pipeline*               m_meshPipeline   = nullptr;
+
+    // Scene 3: PBR multi-submesh model
+    std::unique_ptr<PBRModel> m_pbrModel;
+    Pipeline*                 m_pbrPipeline = nullptr;
+    float                     m_pbrCameraPos[3] = { 0.0f, 1.5f, 3.0f };
 
     uint32_t m_lastImageIndex  = 0;
     uint32_t m_frameCount      = 0;

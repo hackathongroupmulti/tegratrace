@@ -2,14 +2,17 @@
 #include "Pipeline.h"
 #include "RenderPass.h"
 #include "Buffer.h"
+#include "PBRModel.h"
 #include "core/VulkanContext.h"
 #include "core/Swapchain.h"
 #include "profiling/GPUProfiler.h"
+#include <tiny_obj_loader.h>
 #include <stdexcept>
 #include <cmath>
 #include <cstring>
 #include <array>
 #include <vector>
+#include <iostream>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -77,6 +80,8 @@ Renderer::~Renderer() {
     m_uniformBuffers.clear();
     m_vertexBuffer.reset();
     m_indexBuffer.reset();
+    m_meshVertexBuffer.reset();
+    m_meshIndexBuffer.reset();
     vkDestroyCommandPool(m_ctx.device(), m_commandPool, nullptr);
 }
 
@@ -275,6 +280,120 @@ void Renderer::createTexture() {
     VK_CHECK(vkCreateSampler(m_ctx.device(), &sci, nullptr, &m_sampler));
 }
 
+void Renderer::loadMesh(const std::string& objPath) {
+    std::vector<Vertex>   verts;
+    std::vector<uint32_t> indices;
+
+    if (!objPath.empty()) {
+        tinyobj::attrib_t                attrib;
+        std::vector<tinyobj::shape_t>    shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string errMsg;
+
+        if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &errMsg, objPath.c_str())) {
+            std::cerr << "[Mesh] Failed to load OBJ '" << objPath << "': " << errMsg << "\n";
+        } else {
+            if (!errMsg.empty()) std::cerr << "[Mesh] OBJ: " << errMsg << "\n";
+
+            // Expand to unindexed flat triangles then re-index naively
+            for (auto& shape : shapes) {
+                for (auto& idx : shape.mesh.indices) {
+                    Vertex v{};
+                    int pi = idx.vertex_index * 3;
+                    v.pos[0] = attrib.vertices[pi+0];
+                    v.pos[1] = attrib.vertices[pi+1];
+                    v.pos[2] = attrib.vertices[pi+2];
+
+                    if (idx.normal_index >= 0) {
+                        // Map normal to color for visual interest
+                        int ni = idx.normal_index * 3;
+                        v.color[0] = std::abs(attrib.normals[ni+0]);
+                        v.color[1] = std::abs(attrib.normals[ni+1]);
+                        v.color[2] = std::abs(attrib.normals[ni+2]);
+                    } else {
+                        v.color[0] = v.color[1] = v.color[2] = 0.8f;
+                    }
+
+                    if (idx.texcoord_index >= 0) {
+                        int ti = idx.texcoord_index * 2;
+                        v.uv[0] = attrib.texcoords[ti+0];
+                        v.uv[1] = 1.0f - attrib.texcoords[ti+1]; // flip V for Vulkan
+                    }
+
+                    indices.push_back(static_cast<uint32_t>(verts.size()));
+                    verts.push_back(v);
+                }
+            }
+            std::cout << "[Mesh] Loaded OBJ '" << objPath << "': "
+                      << verts.size()/3 << " triangles\n";
+        }
+    }
+
+    // Fall back to procedural UV sphere if OBJ failed or none given
+    if (verts.empty()) {
+        constexpr uint32_t SLICES = 120, STACKS = 120;
+        constexpr float    R      = 1.0f;
+        const float PI = 3.14159265358979323846f;
+
+        for (uint32_t i = 0; i <= STACKS; ++i) {
+            float phi = PI * i / STACKS;
+            for (uint32_t j = 0; j <= SLICES; ++j) {
+                float theta = 2.0f * PI * j / SLICES;
+                float x = R * std::sin(phi) * std::cos(theta);
+                float y = R * std::cos(phi);
+                float z = R * std::sin(phi) * std::sin(theta);
+                Vertex v{};
+                v.pos[0] = x; v.pos[1] = y; v.pos[2] = z;
+                v.color[0] = std::abs(x); v.color[1] = std::abs(y); v.color[2] = std::abs(z);
+                v.uv[0] = static_cast<float>(j) / SLICES;
+                v.uv[1] = static_cast<float>(i) / STACKS;
+                verts.push_back(v);
+            }
+        }
+        for (uint32_t i = 0; i < STACKS; ++i) {
+            for (uint32_t j = 0; j < SLICES; ++j) {
+                uint32_t a = i * (SLICES+1) + j;
+                uint32_t b = a + 1;
+                uint32_t c = a + (SLICES+1);
+                uint32_t d = c + 1;
+                indices.push_back(a); indices.push_back(c); indices.push_back(b);
+                indices.push_back(b); indices.push_back(c); indices.push_back(d);
+            }
+        }
+        std::cout << "[Mesh] Generated UV sphere: " << indices.size()/3 << " triangles\n";
+    }
+
+    waitIdle();
+    m_meshIndexCount = static_cast<uint32_t>(indices.size());
+
+    VkDeviceSize vsize = verts.size()   * sizeof(Vertex);
+    VkDeviceSize isize = indices.size() * sizeof(uint32_t);
+
+    m_meshVertexBuffer = std::make_unique<Buffer>(m_ctx, vsize,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_meshVertexBuffer->upload(m_commandPool, verts.data(), vsize);
+
+    m_meshIndexBuffer = std::make_unique<Buffer>(m_ctx, isize,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    m_meshIndexBuffer->upload(m_commandPool, indices.data(), isize);
+}
+
+void Renderer::loadPBRModel(const std::string& fbxPath) {
+    waitIdle();
+    m_pbrModel = std::make_unique<PBRModel>(m_ctx);
+    if (!m_pbrModel->load(fbxPath, m_commandPool)) {
+        std::cerr << "[Renderer] PBR model load failed: " << fbxPath << "\n";
+        m_pbrModel.reset();
+        return;
+    }
+    if (m_pbrPipeline) {
+        m_pbrModel->createDescriptorResources(
+            m_pbrPipeline->dsLayout(), Swapchain::kMaxFramesInFlight);
+    }
+}
+
 void Renderer::updateUniformBuffer(uint32_t frame, uint32_t frameNumber) {
     UniformBufferObject ubo{};
 
@@ -283,12 +402,26 @@ void Renderer::updateUniformBuffer(uint32_t frame, uint32_t frameNumber) {
         memcpy(ubo.view, m_replayData->view, sizeof(ubo.view));
         memcpy(ubo.proj, m_replayData->proj, sizeof(ubo.proj));
     } else {
-        auto view = glm::mat4(1.0f);
-
         auto ext    = m_swapchain.extent();
         float aspect = static_cast<float>(ext.width) / static_cast<float>(ext.height);
-        float fov = (m_scene == 1) ? 60.0f : 45.0f;
-        auto proj   = glm::perspective(glm::radians(fov), aspect, 0.1f, 100.0f);
+
+        glm::mat4 view;
+        if (m_scene == 3) {
+            // Orbit camera for PBR model: slow horizontal circle at eye level
+            float t   = frameNumber * 0.004f;
+            glm::vec3 eye = { 2.5f * std::sin(t), 1.5f, 2.5f * std::cos(t) };
+            glm::vec3 at  = { 0.0f, 0.9f, 0.0f };
+            view = glm::lookAt(eye, at, { 0.0f, 1.0f, 0.0f });
+            m_pbrCameraPos[0] = eye.x;
+            m_pbrCameraPos[1] = eye.y;
+            m_pbrCameraPos[2] = eye.z;
+        } else {
+            view = glm::mat4(1.0f);
+        }
+
+        float fov = (m_scene == 1) ? 60.0f : (m_scene == 2) ? 50.0f :
+                    (m_scene == 3) ? 45.0f  : 45.0f;
+        auto proj   = glm::perspective(glm::radians(fov), aspect, 0.01f, 200.0f);
         proj[1][1] *= -1.0f;  // Vulkan Y-flip
 
         memcpy(ubo.view, glm::value_ptr(view), sizeof(ubo.view));
@@ -365,8 +498,8 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
         auto model = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.3f, 1.0f, 0.2f));
         model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -2.5f)) * model;
         models.push_back(model);
-    } else {
-        // Scene 1: 5x5 grid of 25 cubes
+    } else if (m_scene == 1) {
+        // 5x5 grid of 25 cubes
         for (int row = 0; row < 5; ++row) {
             for (int col = 0; col < 5; ++col) {
                 float x = (col - 2) * 1.5f;
@@ -378,29 +511,126 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
                 models.push_back(model);
             }
         }
+    } else {
+        // Scene 2: single mesh (sphere or loaded OBJ)
+        auto model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -3.0f));
+        model = model * glm::rotate(glm::mat4(1.0f), angle * 0.4f, glm::vec3(0.0f, 1.0f, 0.0f));
+        models.push_back(model);
+    }
+
+    // Scene 2 uses its own vertex/index buffers and optionally a different pipeline
+    const bool isMeshScene = (m_scene == 2) && m_meshVertexBuffer && m_meshIndexBuffer;
+    if (isMeshScene) {
+        if (m_meshPipeline) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_meshPipeline->handle());
+            // Rebind descriptor sets under the mesh pipeline layout
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_meshPipeline->layout(), 0, 1,
+                &m_descriptorSets[frameIdx % Swapchain::kMaxFramesInFlight], 0, nullptr);
+        }
+        VkBuffer     mvbuf  = m_meshVertexBuffer->handle();
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mvbuf, &offset);
+        vkCmdBindIndexBuffer(cmd, m_meshIndexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+    }
+
+    // ---- Scene 3: PBR multi-submesh model ----
+    const bool isPBRScene = (m_scene == 3) && m_pbrModel && m_pbrModel->isLoaded() && m_pbrPipeline;
+    if (isPBRScene) {
+        m_lastDrawCalls.clear();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pbrPipeline->handle());
+
+        // Scale model to metric units (XPS/RE engine uses centimetres → multiply by 0.01)
+        glm::mat4 modelMat = glm::scale(glm::mat4(1.0f), glm::vec3(0.01f));
+
+        uint32_t fi = frameIdx % Swapchain::kMaxFramesInFlight;
+        for (int s = 0; s < static_cast<int>(m_pbrModel->submeshes().size()); ++s) {
+            const auto& sub = m_pbrModel->submeshes()[s];
+
+            VkDescriptorSet ds = m_pbrModel->descriptorSet(s, fi);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_pbrPipeline->layout(), 0, 1, &ds, 0, nullptr);
+
+            vkCmdPushConstants(cmd, m_pbrPipeline->layout(),
+                VK_SHADER_STAGE_VERTEX_BIT, 0, 64, glm::value_ptr(modelMat));
+
+            VkBuffer     vbuf   = sub.vertexBuffer->handle();
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &offset);
+            vkCmdBindIndexBuffer(cmd, sub.indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, sub.indexCount, 1, 0, 0, 0);
+
+            stats.drawCalls++;
+            stats.indexCount += sub.indexCount;
+
+            if (m_captureCallback) {
+                DrawCallRecord rec{};
+                rec.vertexCount   = sub.indexCount;
+                rec.instanceCount = 1;
+                rec.indexCount    = sub.indexCount;
+                rec.pipeline      = m_pbrPipeline->name();
+                rec.vertShader    = m_pbrPipeline->vertSpvPath();
+                rec.fragShader    = m_pbrPipeline->fragSpvPath();
+                rec.viewportW     = static_cast<float>(ext.width);
+                rec.viewportH     = static_cast<float>(ext.height);
+                memcpy(rec.model, glm::value_ptr(modelMat), 64);
+                memcpy(rec.view,  m_currentView, 64);
+                memcpy(rec.proj,  m_currentProj, 64);
+                m_lastDrawCalls.push_back(rec);
+            }
+        }
+
+        if (m_captureCallback && !m_lastDrawCalls.empty())
+            m_captureCallback(frameNumber, m_lastDrawCalls);
+
+        if (m_frameCallback) m_frameCallback(frameNumber, cmd, stats);
+        vkCmdEndRenderPass(cmd);
+
+        if (m_profiler) m_profiler->endPass(cmd, profIdx);  // end "main"
+        if (m_profiler) m_profiler->beginPass(cmd, profIdx, "barrier");
+        {
+            VkMemoryBarrier mb{};
+            mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        if (m_profiler) m_profiler->endPass(cmd, profIdx);  // end "barrier"
+        if (m_profiler) m_profiler->endPipelineStats(cmd, profIdx);
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        return cmd;
     }
 
     std::vector<DrawCallRecord> records;
+    Pipeline& activePipelineRef = (isMeshScene && m_meshPipeline) ? *m_meshPipeline : m_pipeline;
 
     for (auto& model : models) {
-        // Push model matrix via push constants
-        vkCmdPushConstants(cmd, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT,
+        vkCmdPushConstants(cmd, activePipelineRef.layout(), VK_SHADER_STAGE_VERTEX_BIT,
                            0, 64, glm::value_ptr(model));
-        vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
 
-        stats.drawCalls++;
-        stats.indexCount  += m_indexCount;
-        stats.vertexCount += static_cast<uint32_t>(kCubeVerts.size());
+        if (isMeshScene) {
+            vkCmdDrawIndexed(cmd, m_meshIndexCount, 1, 0, 0, 0);
+            stats.drawCalls++;
+            stats.indexCount  += m_meshIndexCount;
+        } else {
+            vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+            stats.drawCalls++;
+            stats.indexCount  += m_indexCount;
+            stats.vertexCount += static_cast<uint32_t>(kCubeVerts.size());
+        }
 
         if (m_captureCallback) {
             DrawCallRecord rec{};
-            rec.vertexCount    = static_cast<uint32_t>(kCubeVerts.size());
+            rec.vertexCount    = isMeshScene ? m_meshIndexCount : static_cast<uint32_t>(kCubeVerts.size());
             rec.instanceCount  = 1;
-            rec.indexCount     = m_indexCount;
+            rec.indexCount     = isMeshScene ? m_meshIndexCount : m_indexCount;
             rec.firstVertex    = 0;
-            rec.pipeline       = m_pipeline.name();
-            rec.vertShader     = m_pipeline.vertSpvPath();
-            rec.fragShader     = m_pipeline.fragSpvPath();
+            rec.pipeline       = activePipelineRef.name();
+            rec.vertShader     = activePipelineRef.vertSpvPath();
+            rec.fragShader     = activePipelineRef.fragSpvPath();
             rec.viewportW      = static_cast<float>(ext.width);
             rec.viewportH      = static_cast<float>(ext.height);
             memcpy(rec.model, glm::value_ptr(model), sizeof(rec.model));
@@ -464,8 +694,19 @@ bool Renderer::drawFrame(uint32_t frameNumber) {
 
     updateUniformBuffer(frameIdx % Swapchain::kMaxFramesInFlight, frameNumber);
 
+    // Update PBR model UBO when in scene 3
+    if (m_scene == 3 && m_pbrModel && m_pbrModel->isLoaded()) {
+        static const float kLightDir[4]   = { 0.577f, 0.577f, 0.577f, 0.0f };
+        static const float kLightColor[4] = { 1.0f, 0.98f, 0.95f, 3.5f };
+        float camPos4[4] = { m_pbrCameraPos[0], m_pbrCameraPos[1], m_pbrCameraPos[2], 1.0f };
+        m_pbrModel->updateUBO(frameIdx % Swapchain::kMaxFramesInFlight,
+                              m_currentView, m_currentProj,
+                              camPos4, kLightDir, kLightColor);
+    }
+
     FrameDrawStats stats{};
     auto cmd = recordCommandBuffer(imageIndex, frameNumber, stats);
+    m_lastFrameStats = stats;
 
     result = m_swapchain.submitAndPresent(imageIndex, cmd);
     if (result == VK_ERROR_OUT_OF_DATE_KHR) { handleResize(); return false; }
