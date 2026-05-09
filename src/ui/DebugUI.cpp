@@ -93,6 +93,7 @@ void DebugUI::buildPanels(const UIFrameData& data) {
     panelCommandBufferInspector(data);
     panelSubmeshTimings(data);
     panelReplayControls();
+    panelPerfCounters();
 }
 
 void DebugUI::panelFrameTiming(const UIFrameData& data) {
@@ -287,6 +288,21 @@ void DebugUI::panelReplayControls() {
                 m_replayPassed ? "PASS" : "FAIL");
         }
     }
+    ImGui::End();
+}
+
+void DebugUI::panelPerfCounters() {
+    if (m_perfCounterNames.empty()) return;
+    ImGui::SetNextWindowPos({330, 640}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 200}, ImGuiCond_Once);
+    ImGui::Begin("GPU Performance Counters");
+    ImGui::TextDisabled("%d counters available (VK_KHR_performance_query)",
+                        (int)m_perfCounterNames.size());
+    ImGui::Separator();
+    ImGui::BeginChild("##perf_list", {0, 0}, false, ImGuiWindowFlags_None);
+    for (const auto& name : m_perfCounterNames)
+        ImGui::TextUnformatted(name.c_str());
+    ImGui::EndChild();
     ImGui::End();
 }
 

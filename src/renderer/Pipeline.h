@@ -37,14 +37,25 @@ public:
     const std::string& vertSpvPath()     const { return m_vertSpvPath; }
     const std::string& fragSpvPath()     const { return m_fragSpvPath; }
 
+    // Reload SPIR-V from disk and recreate the VkPipeline in-place.
+    // Returns true on success; keeps old pipeline on failure.
+    bool tryReload();
+
 private:
+    VkPipeline buildGraphicsPipeline() const;  // uses stored m_cfg / m_renderPassHandle / m_extent
+
     VulkanContext& m_ctx;
-    VkPipeline       m_pipeline  = VK_NULL_HANDLE;
-    VkPipelineLayout m_layout    = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_dsLayout = VK_NULL_HANDLE;
+    VkPipeline       m_pipeline        = VK_NULL_HANDLE;
+    VkPipelineLayout m_layout          = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_dsLayout   = VK_NULL_HANDLE;
     std::string      m_name;
     std::string      m_vertSpvPath;
     std::string      m_fragSpvPath;
+
+    // Stored for hot-reload
+    VkRenderPass   m_renderPassHandle = VK_NULL_HANDLE;
+    VkExtent2D     m_extent{};
+    PipelineConfig m_cfg;
 };
 
 } // namespace tgt

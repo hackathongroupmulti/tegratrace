@@ -17,7 +17,10 @@ Pipeline::Pipeline(VulkanContext& ctx, RenderPass& renderPass,
     : m_ctx(ctx),
       m_name(std::filesystem::path(cfg.vertSpvPath).stem().string()),
       m_vertSpvPath(cfg.vertSpvPath),
-      m_fragSpvPath(cfg.fragSpvPath)
+      m_fragSpvPath(cfg.fragSpvPath),
+      m_renderPassHandle(renderPass.handle()),
+      m_extent(extent),
+      m_cfg(cfg)
 {
     // Binding 0: UBO (vertex + fragment stages for PBR; vertex-only for legacy)
     VkDescriptorSetLayoutBinding uboBinding{};
@@ -149,13 +152,124 @@ Pipeline::Pipeline(VulkanContext& ctx, RenderPass& renderPass,
     gci.renderPass          = renderPass.handle();
     gci.subpass             = 0;
 
-    VK_CHECK(vkCreateGraphicsPipelines(ctx.device(), VK_NULL_HANDLE, 1, &gci, nullptr, &m_pipeline));
+    VK_CHECK(vkCreateGraphicsPipelines(ctx.device(), ctx.pipelineCache(), 1, &gci, nullptr, &m_pipeline));
 }
 
 Pipeline::~Pipeline() {
     vkDestroyPipeline(m_ctx.device(), m_pipeline, nullptr);
     vkDestroyPipelineLayout(m_ctx.device(), m_layout, nullptr);
     vkDestroyDescriptorSetLayout(m_ctx.device(), m_dsLayout, nullptr);
+}
+
+bool Pipeline::tryReload() {
+    // Verify SPIR-V files are readable before touching GPU state
+    {
+        std::ifstream v(m_cfg.vertSpvPath, std::ios::binary);
+        std::ifstream f(m_cfg.fragSpvPath, std::ios::binary);
+        if (!v || !f) return false;
+    }
+    try {
+        vkDeviceWaitIdle(m_ctx.device());
+        Shader vert(m_ctx.device(), m_cfg.vertSpvPath);
+        Shader frag(m_ctx.device(), m_cfg.fragSpvPath);
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vert.module();
+        stages[0].pName  = "main";
+        stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = frag.module();
+        stages[1].pName  = "main";
+
+        VkVertexInputBindingDescription binding;
+        std::vector<VkVertexInputAttributeDescription> attribs;
+        if (m_cfg.usePBRVertex) {
+            binding = PBRVertex::bindingDescription();
+            attribs = PBRVertex::attributeDescriptions();
+        } else {
+            binding = Vertex::bindingDescription();
+            attribs = Vertex::attributeDescriptions();
+        }
+        VkPipelineVertexInputStateCreateInfo vis{};
+        vis.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vis.vertexBindingDescriptionCount   = 1;
+        vis.pVertexBindingDescriptions      = &binding;
+        vis.vertexAttributeDescriptionCount = static_cast<uint32_t>(attribs.size());
+        vis.pVertexAttributeDescriptions    = attribs.data();
+
+        VkPipelineInputAssemblyStateCreateInfo ias{};
+        ias.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkViewport viewport{ 0, 0, static_cast<float>(m_extent.width),
+                             static_cast<float>(m_extent.height), 0, 1 };
+        VkRect2D scissor{ {0,0}, m_extent };
+        VkPipelineViewportStateCreateInfo vps{};
+        vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vps.viewportCount = 1; vps.pViewports = &viewport;
+        vps.scissorCount  = 1; vps.pScissors  = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rast{};
+        rast.sType     = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rast.polygonMode = m_cfg.polyMode;
+        rast.cullMode    = m_cfg.cullMode;
+        rast.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rast.lineWidth   = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo ms{};
+        ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo dss{};
+        dss.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        dss.depthTestEnable  = m_cfg.depthTest  ? VK_TRUE : VK_FALSE;
+        dss.depthWriteEnable = m_cfg.depthWrite ? VK_TRUE : VK_FALSE;
+        dss.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+        VkPipelineColorBlendAttachmentState blend{};
+        blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cbs{};
+        cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cbs.attachmentCount = 1; cbs.pAttachments = &blend;
+
+        std::array<VkDynamicState, 2> dynStates = {
+            VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR
+        };
+        VkPipelineDynamicStateCreateInfo dyn{};
+        dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dyn.dynamicStateCount = static_cast<uint32_t>(dynStates.size());
+        dyn.pDynamicStates    = dynStates.data();
+
+        VkGraphicsPipelineCreateInfo gci{};
+        gci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gci.stageCount          = 2;
+        gci.pStages             = stages;
+        gci.pVertexInputState   = &vis;
+        gci.pInputAssemblyState = &ias;
+        gci.pViewportState      = &vps;
+        gci.pRasterizationState = &rast;
+        gci.pMultisampleState   = &ms;
+        gci.pDepthStencilState  = &dss;
+        gci.pColorBlendState    = &cbs;
+        gci.pDynamicState       = &dyn;
+        gci.layout              = m_layout;
+        gci.renderPass          = m_renderPassHandle;
+        gci.subpass             = 0;
+
+        VkPipeline newPipeline = VK_NULL_HANDLE;
+        if (vkCreateGraphicsPipelines(m_ctx.device(), m_ctx.pipelineCache(),
+                                      1, &gci, nullptr, &newPipeline) != VK_SUCCESS)
+            return false;
+
+        vkDestroyPipeline(m_ctx.device(), m_pipeline, nullptr);
+        m_pipeline = newPipeline;
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace tgt

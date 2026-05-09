@@ -1,0 +1,79 @@
+#version 450
+
+// GGX specular prefilter: convolves a cubemap at each roughness level.
+// Dispatch per mip: (mipSize/16, mipSize/16, 6)
+// push_constant: float roughness (0 = mirror, 1 = full diffuse)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform samplerCube uEnvMap;
+layout(binding = 1, rgba16f) uniform writeonly image2DArray uPrefilter;
+
+layout(push_constant) uniform PC { float roughness; };
+
+const float PI = 3.14159265359;
+
+float RadicalInverse_VdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+vec2 Hammersley(uint i, uint N) {
+    return vec2(float(i) / float(N), RadicalInverse_VdC(i));
+}
+
+vec3 ImportanceSampleGGX(vec2 Xi, vec3 N, float a2) {
+    float phi      = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / max(1.0 + (a2 - 1.0) * Xi.y, 1e-7));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    vec3 H = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    vec3 up    = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 right = normalize(cross(up, N));
+    vec3 fwd   = cross(N, right);
+    return normalize(right * H.x + fwd * H.y + N * H.z);
+}
+
+vec3 faceDir(uint face, vec2 uv) {
+    switch (face) {
+        case 0u: return normalize(vec3( 1.0,  uv.y, -uv.x));
+        case 1u: return normalize(vec3(-1.0,  uv.y,  uv.x));
+        case 2u: return normalize(vec3( uv.x,  1.0, -uv.y));
+        case 3u: return normalize(vec3( uv.x, -1.0,  uv.y));
+        case 4u: return normalize(vec3( uv.x,  uv.y,  1.0));
+        default: return normalize(vec3(-uv.x,  uv.y, -1.0));
+    }
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    ivec2 size  = imageSize(uPrefilter).xy;
+    if (coord.x >= size.x || coord.y >= size.y) return;
+
+    vec2 uv = (vec2(coord.xy) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec3 N  = faceDir(uint(coord.z), uv);
+    vec3 V  = N; // split-sum approximation: V = R = N
+
+    float a  = roughness * roughness;
+    float a2 = a * a;
+
+    const uint SAMPLES     = 1024u;
+    vec3       prefColor   = vec3(0.0);
+    float      totalWeight = 0.0;
+
+    for (uint i = 0u; i < SAMPLES; ++i) {
+        vec2 Xi = Hammersley(i, SAMPLES);
+        vec3 H  = ImportanceSampleGGX(Xi, N, a2);
+        vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL > 0.0) {
+            prefColor   += texture(uEnvMap, L).rgb * NdotL;
+            totalWeight += NdotL;
+        }
+    }
+    prefColor /= max(totalWeight, 0.001);
+    imageStore(uPrefilter, coord, vec4(prefColor, 1.0));
+}

@@ -76,12 +76,28 @@ public:
     void insertDebugLabel(VkCommandBuffer cmd, const char* name,
                           float r = 1.0f, float g = 1.0f, float b = 0.0f) const;
 
+    // Pipeline cache (eliminates warmup compilation spikes across runs)
+    VkPipelineCache pipelineCache() const { return m_pipelineCache; }
+    void loadPipelineCache(const std::string& path);
+    void savePipelineCache(const std::string& path) const;
+
+    // VK_KHR_performance_query: hardware counter enumeration (optional, read-only)
+    struct PerfCounter {
+        std::string name;
+        std::string category;
+        std::string description;
+        uint32_t    index = 0;
+    };
+    bool perfQuerySupported()               const { return m_perfQuerySupported; }
+    const std::vector<PerfCounter>& perfCounters() const { return m_perfCounters; }
+
 private:
     void createInstance();
     void setupDebugMessenger();
     void pickPhysicalDevice();
     void createLogicalDevice();
     void loadDebugLabelFunctions();
+    void enumeratePerfCounters();
 
     bool checkValidationLayerSupport() const;
     bool isDeviceSuitable(VkPhysicalDevice dev, VkSurfaceKHR surface) const;
@@ -111,6 +127,14 @@ private:
     PFN_vkCmdBeginDebugUtilsLabelEXT  m_fnBeginLabel  = nullptr;
     PFN_vkCmdEndDebugUtilsLabelEXT    m_fnEndLabel    = nullptr;
     PFN_vkCmdInsertDebugUtilsLabelEXT m_fnInsertLabel = nullptr;
+
+    // Pipeline cache
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
+
+    // VK_KHR_performance_query
+    bool                    m_perfQuerySupported = false;
+    std::vector<PerfCounter> m_perfCounters;
+    PFN_vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR m_fnEnumPerfCounters = nullptr;
 
     uint32_t                       m_currentFrame = 0;
     mutable std::mutex             m_logMutex;

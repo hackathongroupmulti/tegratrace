@@ -3,8 +3,9 @@
 **Vulkan Graphics Validation and Diagnostics Platform**
 
 A low-level graphics tooling platform built on Vulkan 1.2. TegraTrace renders scenes through a
-configurable GPU pipeline and wraps them in six integrated subsystems: frame capture, replay,
-GPU profiling, regression validation, synchronization diagnostics, and a live debug overlay.
+configurable GPU pipeline and wraps them in integrated subsystems: frame capture, replay,
+GPU profiling, regression validation, synchronization diagnostics, IBL rendering, GPU-driven
+indirect rendering, and a live debug overlay.
 
 The renderer is the subject under test — not the project itself. The same pattern used internally
 in driver and graphics tools teams: a controlled rendering harness that can inspect, reproduce,
@@ -14,17 +15,19 @@ and validate its own output.
 
 ## Measured Performance (RTX 3060 Laptop GPU)
 
-### PBR model scene — Leon S. Kennedy (RE4R XPS, 49 submeshes, 4K textures)
+### PBR model scene — Leon S. Kennedy (RE4R XPS, 49 submeshes, 194,242 verts, 4K textures)
 
 | Metric | Value |
 |---|---|
-| Headless FPS (300 frames) | **~653 avg** |
-| GPU frame time p50 | **0.27 ms** |
-| GPU frame time p99 | **5.6 ms** (pipeline warmup tail) |
-| Hottest submesh (jacket) | **0.33 ms avg** |
-| Hottest submesh (pants) | **0.30 ms avg** |
+| Headless FPS (300 frames) | **~979 avg** |
+| CPU frame time p50 | **0.27 ms** |
+| GPU frame time p50 | **0.22 ms** |
+| GPU frame time p95 | **6.48 ms** |
+| GPU frame time p99 | **12.24 ms** (pipeline warmup tail; eliminated by pipeline cache on warm runs) |
+| Hottest submesh (pants) | **~0.21 ms avg** |
+| Hottest submesh (jacket) | **~0.19 ms avg** |
 | Barrier probe overhead | **< 0.01 ms** |
-| Unique texture uploads | **52** (cache dedup from ~160 references) |
+| Unique texture uploads | **58** (cache dedup from ~160 references) |
 | Spike frames | **0** |
 | GPU timestamp resolution | **1 ns/tick** |
 
@@ -32,8 +35,8 @@ and validate its own output.
 
 | Metric | Value |
 |---|---|
-| Headless FPS (scene 0 — single cube) | **~15,800 avg** |
-| Headless FPS (scene 1 — 25-cube grid) | **~15,300 avg** |
+| Headless FPS (scene 0 — single cube) | **~18,724 avg** |
+| Headless FPS (scene 1 — 25-cube grid) | **~17,627 avg** |
 | Regression PSNR (deterministic repro) | **100.0 dB** |
 
 ---
@@ -47,18 +50,27 @@ pipeline, descriptor sets, UBOs, push constants (per-object model matrix), verte
 buffers, GPU texture upload with layout transitions, dynamic viewport/scissor, and
 synchronization via semaphores and fences.
 
+**Nsight / RenderDoc debug markers** — `VK_EXT_debug_utils` is always requested at instance
+creation. Per-frame label regions are opened/closed via `vkCmdBeginDebugUtilsLabelEXT` /
+`vkCmdEndDebugUtilsLabelEXT` (function pointers loaded at device creation, null-safe on hardware
+that does not expose the extension). In scene 3 each submesh draw is wrapped in its own
+`PBR_Model / sub:<name>` label hierarchy, making pass boundaries immediately visible in Nsight
+Frame Debugger and RenderDoc's event tree.
+
 Four built-in scenes:
 
 - **Scene 0** — single rotating cube, 1 draw call/frame, 36 indices
 - **Scene 1** — 5×5 grid of 25 independently rotating cubes, 25 draw calls/frame
 - **Scene 2** — procedural UV sphere (28,800 triangles) or OBJ mesh via `--mesh`. Lambertian diffuse.
-- **Scene 3** — multi-submesh PBR FBX model via `--fbx`. Cook-Torrance BRDF with 5 texture
-  maps per submesh (albedo, normal, roughness, metallic, AO). Orbit camera with mouse drag and scroll zoom.
+- **Scene 3** — multi-submesh PBR FBX model via `--fbx`. Cook-Torrance BRDF with proper split-sum
+  cubemap IBL (8 texture bindings: albedo, normal, roughness, metallic, AO, GGX prefiltered cube,
+  BRDF LUT, diffuse irradiance cube). GPU frustum culling compute pass. Orbit camera with mouse
+  drag and scroll zoom.
 
 ### 2. PBR Model Loader
 
-Loads FBX files via Assimp 5.4.3 (FBX + OBJ importers). Per-material texture resolution handles
-XPS export conventions where the FBX may reference only a subset of available maps:
+Loads FBX files via Assimp 5.4.3. Per-material texture resolution handles XPS export conventions
+where the FBX may reference only a subset of available maps:
 
 - **Suffix-based slot detection** — `_D`/`_ATOC` → albedo (sRGB), `_N` → normal (linear),
   `_R`/`_S` → roughness, `_M` → metallic, `_AO` → ambient occlusion
@@ -66,11 +78,32 @@ XPS export conventions where the FBX may reference only a subset of available ma
   scan: strips the known suffix from loaded texture filenames (e.g. `Leon_Hair_N.png` → base
   `Leon_Hair`), then probes for the missing file (`Leon_Hair_D.png`, `Leon_Hair_R.png`, etc.)
 - **Texture cache** — resolves duplicate references across materials to a single `VkImage`,
-  eliminating redundant GPU uploads (52 unique vs ~160 total references for Leon)
+  eliminating redundant GPU uploads (58 unique vs ~160 total references for Leon)
+- **Full mip chain generation** — every texture upload blit-generates all mip levels via
+  `vkCmdBlitImage` (`VK_FILTER_LINEAR`), `mipLevels = floor(log2(max(w,h)))+1`. Sampler uses
+  `VK_LOD_CLAMP_NONE` to let the hardware select optimal mip at all distances.
 - **Cook-Torrance BRDF** — GGX NDF, Smith-Schlick geometry, Fresnel-Schlick; Reinhard
   tonemapping + gamma correction. Alpha discard at 0.1 for hair/transparency submeshes.
 - **Tangent-space normal mapping** — TBN matrix with Gram-Schmidt re-orthogonalization in
   the vertex shader; Assimp `CalcTangentSpace` provides per-vertex tangent/bitangent.
+- **IBL (split-sum, GPU compute)** — at load time generates a 256×256 GGX BRDF integration
+  LUT on the CPU (512 Hammersley samples per texel), then runs three compute shaders to build
+  proper cubemap resources: `env_to_cube.comp` converts the equirectangular HDR to a 512×512
+  cubemap; `ibl_prefilter.comp` convolves it with GGX at 8 roughness mip levels (256×256,
+  Hammersley 1024-sample importance sampling, split-sum V=N approximation); `ibl_irradiance.comp`
+  integrates the hemisphere to a 32×32 diffuse irradiance cubemap (~3906 samples/texel). The
+  fragment shader binds all three as `samplerCube`: `texEnvPrefiltered` (binding 6, roughness LOD),
+  `texBrdfLut` (binding 7), `texIrradiance` (binding 8).
+- **GPU-driven indirect rendering** — all submesh geometry is consolidated into a single VBO
+  and IBO at load time. A `VkBuffer` of `VkDrawIndexedIndirectCommand` entries (one per submesh)
+  is uploaded with `VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT`. Scene 3 records geometry buffers once
+  and then issues one `vkCmdDrawIndexedIndirect` call per submesh, with draw parameters
+  (index count, first index, vertex offset) residing entirely in GPU memory.
+- **GPU frustum culling** — a compute shader (`cull.comp`) runs before the draw pass each frame.
+  It extracts 6 frustum planes from the view-projection matrix (Gribb-Hartmann), tests per-submesh
+  world-space bounding spheres (precomputed at load time with the fixed model transform applied),
+  and writes `instanceCount = 0` for culled draws into a per-frame culled indirect buffer.
+  A `VkMemoryBarrier` synchronizes compute writes to indirect draw reads. No CPU readback.
 
 ### 3. Frame Capture and Replay
 
@@ -121,7 +154,48 @@ headless rendering produces **100.0 dB PSNR** (pixel-perfect). Threshold: ≥ 40
 `--multi-res` additionally tests at 50% and 25% scale. Per-pixel diff heatmaps are written
 alongside each result.
 
-### 6. Debug UI (Dear ImGui)
+### 6. VRAM Budget Monitoring
+
+`VK_EXT_memory_budget` is optionally enabled at device creation (gracefully absent on older
+drivers). `vkGetPhysicalDeviceMemoryProperties2` is called each frame with a chained
+`VkPhysicalDeviceMemoryBudgetPropertiesEXT` to read per-heap budget and usage in bytes. The
+debug overlay's VRAM Budget panel renders a colour-coded progress bar per heap (green below 85%,
+red at or above 85%).
+
+### 7. Pipeline Cache and Shader Hot-Reload
+
+**`VkPipelineCache` serialization** — on startup, `loadPipelineCache("pipeline.cache")` populates
+the pipeline cache from a binary file written by the previous run. All pipeline creation calls
+(`vkCreateGraphicsPipelines`, `vkCreateComputePipelines`) pass this cache object; the driver
+reuses compiled binaries instead of recompiling from SPIR-V. On exit, `savePipelineCache` writes
+the updated binary back. This directly eliminates the p99=12.24 ms warmup spike seen on cold runs.
+
+**Shader hot-reload** — `ShaderWatcher` polls `std::filesystem::last_write_time` on .spv files
+every 60 frames. When a timestamp changes, `Pipeline::tryReload()` calls `vkDeviceWaitIdle`,
+recompiles the pipeline from the new SPIR-V, swaps the `VkPipeline` handle, and destroys the old
+one. Descriptor sets and `VkPipelineLayout` are unchanged. Failures leave the old pipeline intact.
+
+### 8. GPU Frustum Culling
+
+A pre-draw compute pass dispatched each frame:
+
+1. Extracts 6 view-frustum planes from the combined VP matrix (Gribb-Hartmann row method).
+2. Tests each submesh's world-space bounding sphere (precomputed at load time with the fixed model
+   transform applied — no per-frame matrix upload needed).
+3. Writes `instanceCount = 0` for culled submeshes into a per-frame `VkBuffer` that is then used
+   as the indirect draw source. A `VkMemoryBarrier` (`SHADER_WRITE → INDIRECT_COMMAND_READ`)
+   ensures the GPU sees the culled counts before the draw pass reads them.
+
+### 9. VK_KHR_performance_query
+
+`VkPhysicalDevicePerformanceQueryFeaturesKHR` is chained into device creation when the extension
+is available. On initialization, all vendor-specific hardware performance counters are enumerated
+via `vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR` and stored with their
+category and description strings. The debug overlay's GPU Performance Counters panel lists the
+available counter names by category, giving immediate visibility into what hardware-level metrics
+the platform can collect (e.g., SM utilization, L2 hit rate, instruction throughput).
+
+### 10. Debug UI (Dear ImGui)
 
 Live overlay rendered inside the Vulkan render pass via `imgui_impl_vulkan`:
 
@@ -135,6 +209,8 @@ Live overlay rendered inside the Vulkan render pass via `imgui_impl_vulkan`:
 | Submesh GPU Timings | Per-submesh GPU time as scaled progress bars (scene 3 only) |
 | Scene Control | Switch scenes at runtime |
 | Replay Controls | Scan captures dir, select frame, trigger replay, display PSNR result |
+| VRAM Budget | Per-heap budget/used (MiB) as colour-coded progress bars |
+| GPU Performance Counters | Available `VK_KHR_performance_query` counter names by category (shown when extension supported) |
 
 ---
 
@@ -204,12 +280,16 @@ and uploads `tegratrace.exe` as an artifact on every push to `main`.
 
 ```
 src/
-  core/        VulkanContext, Window, Swapchain
-  renderer/    Buffer, RenderPass, Pipeline, Renderer, PBRModel
+  core/        VulkanContext (debug labels, VRAM budget, pipeline cache, VK_KHR_performance_query),
+               Window, Swapchain
+  renderer/    Buffer, RenderPass, Pipeline (tryReload), ShaderWatcher, Renderer,
+               PBRModel (IBL compute, mipmaps, GPU frustum culling, GPU-driven indirect, texture cache)
   profiling/   GPUProfiler  — timestamp + pipeline stats, per-submesh timing, spike/jitter detection
   capture/     FrameCapture, FrameReplayer
   validation/  RegressionTester — readback, PSNR, multi-res, heatmap diff
   metrics/     MetricsCollector — FPS, CPU latency percentiles, JSON export
-  ui/          DebugUI — 8-panel ImGui overlay
-shaders/       GLSL (triangle, mesh, pbr) compiled to SPIR-V by CMake/glslc
+  ui/          DebugUI — 10-panel ImGui overlay
+shaders/       GLSL compiled to SPIR-V by CMake/glslc:
+               pbr.vert/frag, cull.comp, env_to_cube.comp, ibl_prefilter.comp, ibl_irradiance.comp,
+               triangle.vert/frag, mesh.vert/frag, cube_field.vert
 ```

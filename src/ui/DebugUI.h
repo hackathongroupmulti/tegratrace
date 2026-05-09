@@ -62,6 +62,9 @@ public:
     void newFrame();
     void render(VkCommandBuffer cmd, const UIFrameData& data);
 
+    // Populate the GPU performance counter panel from VulkanContext::perfCounters()
+    void setPerfCounters(const std::vector<std::string>& names) { m_perfCounterNames = names; }
+
     void setSceneCallback(SceneCallback cb)   { m_sceneCallback  = std::move(cb); }
     void setReplayCallback(ReplayCallback cb) { m_replayCallback = std::move(cb); }
     void setCapturesDir(const std::string& d) { m_capturesDir = d; scanCaptureFiles(); }
@@ -80,6 +83,7 @@ private:
     void panelReplayControls();
     void panelSubmeshTimings(const UIFrameData& data);
     void panelVRAMBudget(const UIFrameData& data);
+    void panelPerfCounters();
     void scanCaptureFiles();
 
     VulkanContext&   m_ctx;
@@ -92,6 +96,9 @@ private:
     SceneCallback  m_sceneCallback;
     ReplayCallback m_replayCallback;
     int            m_activeScene = 0;
+
+    // VK_KHR_performance_query: counter names enumerated at init
+    std::vector<std::string> m_perfCounterNames;
 
     // Replay panel state
     std::string              m_capturesDir;

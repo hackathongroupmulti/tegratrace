@@ -9,6 +9,7 @@
 #include <stb_image.h>
 
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <cstring>
@@ -44,6 +45,7 @@ PBRModel::~PBRModel() {
     m_consolidatedVBO.reset();
     m_consolidatedIBO.reset();
     m_indirectBuffer.reset();
+    m_sphereBuffer.reset();
 
     // Fallback textures
     if (m_fbWhiteView) vkDestroyImageView(m_ctx.device(), m_fbWhiteView, nullptr);
@@ -55,13 +57,26 @@ PBRModel::~PBRModel() {
     if (m_fbNormMem)   vkFreeMemory(m_ctx.device(), m_fbNormMem, nullptr);
 
     // IBL textures
-    if (m_envView)     vkDestroyImageView(m_ctx.device(), m_envView, nullptr);
-    if (m_envImg)      vkDestroyImage(m_ctx.device(), m_envImg, nullptr);
-    if (m_envMem)      vkFreeMemory(m_ctx.device(), m_envMem, nullptr);
+    if (m_envEquirectView) vkDestroyImageView(m_ctx.device(), m_envEquirectView, nullptr);
+    if (m_envEquirectImg)  vkDestroyImage(m_ctx.device(), m_envEquirectImg, nullptr);
+    if (m_envEquirectMem)  vkFreeMemory(m_ctx.device(), m_envEquirectMem, nullptr);
+
+    if (m_envCubeView) vkDestroyImageView(m_ctx.device(), m_envCubeView, nullptr);
+    if (m_envCubeImg)  vkDestroyImage(m_ctx.device(), m_envCubeImg, nullptr);
+    if (m_envCubeMem)  vkFreeMemory(m_ctx.device(), m_envCubeMem, nullptr);
+
+    for (auto v : m_prefilterMipViews) vkDestroyImageView(m_ctx.device(), v, nullptr);
+    if (m_prefilterView) vkDestroyImageView(m_ctx.device(), m_prefilterView, nullptr);
+    if (m_prefilterImg)  vkDestroyImage(m_ctx.device(), m_prefilterImg, nullptr);
+    if (m_prefilterMem)  vkFreeMemory(m_ctx.device(), m_prefilterMem, nullptr);
 
     if (m_brdfLutView) vkDestroyImageView(m_ctx.device(), m_brdfLutView, nullptr);
     if (m_brdfLutImg)  vkDestroyImage(m_ctx.device(), m_brdfLutImg, nullptr);
     if (m_brdfLutMem)  vkFreeMemory(m_ctx.device(), m_brdfLutMem, nullptr);
+
+    if (m_irradianceView) vkDestroyImageView(m_ctx.device(), m_irradianceView, nullptr);
+    if (m_irradianceImg)  vkDestroyImage(m_ctx.device(), m_irradianceImg, nullptr);
+    if (m_irradianceMem)  vkFreeMemory(m_ctx.device(), m_irradianceMem, nullptr);
 
     if (m_sampler) vkDestroySampler(m_ctx.device(), m_sampler, nullptr);
 }
@@ -489,8 +504,9 @@ void PBRModel::loadEnvMap(VkCommandPool pool) {
     for (const char** ext = kExts; *ext; ++ext) {
         std::string candidate = m_dir + "/Gen_Env" + *ext;
         if (fs::exists(candidate)) {
-            m_envView = loadTextureFile(candidate, false, m_envImg, m_envMem, pool);
-            if (m_envView) return;
+            m_envEquirectView = loadTextureFile(candidate, false,
+                                                m_envEquirectImg, m_envEquirectMem, pool);
+            if (m_envEquirectView) return;
         }
     }
 
@@ -508,12 +524,373 @@ void PBRModel::loadEnvMap(VkCommandPool pool) {
             bool validExt = (ext == ".tga" || ext == ".png" || ext == ".jpg" || ext == ".hdr");
             if (!validExt) continue;
 
-            m_envView = loadTextureFile(entry.path().string(), false, m_envImg, m_envMem, pool);
-            if (m_envView) return;
+            m_envEquirectView = loadTextureFile(entry.path().string(), false,
+                                                m_envEquirectImg, m_envEquirectMem, pool);
+            if (m_envEquirectView) return;
         }
     } catch (...) {}
 
     std::cout << "[PBR] No env map found in '" << m_dir << "' — IBL uses white fallback\n";
+}
+
+// ---------------------------------------------------------------------------
+// SPV loader used by IBL compute passes
+// ---------------------------------------------------------------------------
+static VkShaderModule loadSpvModulePBR(VkDevice device, const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("Cannot open IBL shader: " + path);
+    size_t sz = static_cast<size_t>(f.tellg());
+    std::vector<char> buf(sz);
+    f.seekg(0);
+    f.read(buf.data(), static_cast<std::streamsize>(sz));
+    VkShaderModuleCreateInfo ci{};
+    ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = sz;
+    ci.pCode    = reinterpret_cast<const uint32_t*>(buf.data());
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &mod));
+    return mod;
+}
+
+// ---------------------------------------------------------------------------
+// IBL: Run GPU compute passes to build prefiltered + irradiance cubemaps
+// ---------------------------------------------------------------------------
+void PBRModel::buildIBLCubemaps(VkCommandPool pool) {
+    if (!m_envEquirectView) {
+        std::cout << "[PBR] No env map — skipping IBL cubemap generation\n";
+        return;
+    }
+
+    const std::string kEnvToCubeSpv  = "shaders/env_to_cube.comp.spv";
+    const std::string kPrefilterSpv  = "shaders/ibl_prefilter.comp.spv";
+    const std::string kIrradianceSpv = "shaders/ibl_irradiance.comp.spv";
+
+    for (const auto& p : { kEnvToCubeSpv, kPrefilterSpv, kIrradianceSpv }) {
+        if (!fs::exists(p)) {
+            std::cerr << "[PBR] IBL SPV not found: " << p << " — skipping\n";
+            return;
+        }
+    }
+
+    VkDevice dev = m_ctx.device();
+    constexpr uint32_t kCubeSize = 512;
+    constexpr uint32_t kPrefSize = 256;
+    constexpr uint32_t kPrefMips = 8;   // roughness 0..1 across 8 mip levels
+    constexpr uint32_t kIrrSize  = 32;
+    constexpr VkFormat kFmt      = VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    // --- Create cubemap image helper ---
+    auto createCubeImage = [&](uint32_t size, uint32_t mips,
+                                VkImage& img, VkDeviceMemory& mem) {
+        VkImageCreateInfo ici{};
+        ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.flags         = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        ici.imageType     = VK_IMAGE_TYPE_2D;
+        ici.extent        = { size, size, 1 };
+        ici.mipLevels     = mips;
+        ici.arrayLayers   = 6;
+        ici.format        = kFmt;
+        ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ici.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        VK_CHECK(vkCreateImage(dev, &ici, nullptr, &img));
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(dev, img, &req);
+        VkMemoryAllocateInfo mai{};
+        mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize  = req.size;
+        mai.memoryTypeIndex = m_ctx.findMemoryType(req.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_CHECK(vkAllocateMemory(dev, &mai, nullptr, &mem));
+        VK_CHECK(vkBindImageMemory(dev, img, mem, 0));
+    };
+
+    // --- Create image view helper ---
+    auto makeView = [&](VkImage img, VkImageViewType type,
+                        uint32_t baseMip, uint32_t mipCount) -> VkImageView {
+        VkImageViewCreateInfo ivci{};
+        ivci.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image                           = img;
+        ivci.viewType                        = type;
+        ivci.format                          = kFmt;
+        ivci.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        ivci.subresourceRange.baseMipLevel   = baseMip;
+        ivci.subresourceRange.levelCount     = mipCount;
+        ivci.subresourceRange.baseArrayLayer = 0;
+        ivci.subresourceRange.layerCount     = 6;
+        VkImageView v = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateImageView(dev, &ivci, nullptr, &v));
+        return v;
+    };
+
+    // Allocate all cubemap images
+    createCubeImage(kCubeSize, 1,        m_envCubeImg,    m_envCubeMem);
+    createCubeImage(kPrefSize, kPrefMips, m_prefilterImg,  m_prefilterMem);
+    createCubeImage(kIrrSize,  1,         m_irradianceImg, m_irradianceMem);
+
+    // Persistent views (shader-facing samplerCube views)
+    m_envCubeView    = makeView(m_envCubeImg,    VK_IMAGE_VIEW_TYPE_CUBE,       0, 1);
+    m_prefilterView  = makeView(m_prefilterImg,  VK_IMAGE_VIEW_TYPE_CUBE,       0, kPrefMips);
+    m_irradianceView = makeView(m_irradianceImg, VK_IMAGE_VIEW_TYPE_CUBE,       0, 1);
+    for (uint32_t mip = 0; mip < kPrefMips; ++mip)
+        m_prefilterMipViews.push_back(makeView(m_prefilterImg,
+                                               VK_IMAGE_VIEW_TYPE_2D_ARRAY, mip, 1));
+
+    // Temporary storage-image array views (for compute writes)
+    VkImageView envCubeArrayView = makeView(m_envCubeImg,    VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, 1);
+    VkImageView irrArrayView     = makeView(m_irradianceImg, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, 1);
+
+    // Cubemap sampler: clamp-to-edge to avoid seams at cube face boundaries
+    VkSampler cubeSampler = VK_NULL_HANDLE;
+    {
+        VkSamplerCreateInfo sci{};
+        sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter    = VK_FILTER_LINEAR;
+        sci.minFilter    = VK_FILTER_LINEAR;
+        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod       = VK_LOD_CLAMP_NONE;
+        VK_CHECK(vkCreateSampler(dev, &sci, nullptr, &cubeSampler));
+    }
+
+    // --- Create compute pipeline helper (2 bindings: samplerXxx + storageImage) ---
+    struct IBLPipeline {
+        VkDescriptorSetLayout dsLayout  = VK_NULL_HANDLE;
+        VkPipelineLayout      layout    = VK_NULL_HANDLE;
+        VkPipeline            pipeline  = VK_NULL_HANDLE;
+    };
+
+    auto makeIBLPipeline = [&](const std::string& spvPath, bool pushConst) -> IBLPipeline {
+        IBLPipeline p;
+        // DS layout: binding 0 = sampledImage, binding 1 = storageImage
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        bindings[0] = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                        VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        VkDescriptorSetLayoutCreateInfo dlci{};
+        dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dlci.bindingCount = 2;
+        dlci.pBindings    = bindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(dev, &dlci, nullptr, &p.dsLayout));
+
+        VkPushConstantRange pc{};
+        pc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pc.size       = sizeof(float);
+
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount         = 1;
+        plci.pSetLayouts            = &p.dsLayout;
+        plci.pushConstantRangeCount = pushConst ? 1u : 0u;
+        plci.pPushConstantRanges    = pushConst ? &pc : nullptr;
+        VK_CHECK(vkCreatePipelineLayout(dev, &plci, nullptr, &p.layout));
+
+        VkShaderModule mod = loadSpvModulePBR(dev, spvPath);
+        VkComputePipelineCreateInfo cpci{};
+        cpci.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpci.stage.module = mod;
+        cpci.stage.pName  = "main";
+        cpci.layout       = p.layout;
+        VK_CHECK(vkCreateComputePipelines(dev, m_ctx.pipelineCache(), 1, &cpci, nullptr,
+                                          &p.pipeline));
+        vkDestroyShaderModule(dev, mod, nullptr);
+        return p;
+    };
+
+    auto destroyIBLPipeline = [&](IBLPipeline& p) {
+        if (p.pipeline) vkDestroyPipeline(dev, p.pipeline, nullptr);
+        if (p.layout)   vkDestroyPipelineLayout(dev, p.layout, nullptr);
+        if (p.dsLayout) vkDestroyDescriptorSetLayout(dev, p.dsLayout, nullptr);
+        p = {};
+    };
+
+    IBLPipeline envToCubePL  = makeIBLPipeline(kEnvToCubeSpv,  false);
+    IBLPipeline prefilterPL  = makeIBLPipeline(kPrefilterSpv,   true);
+    IBLPipeline irradiancePL = makeIBLPipeline(kIrradianceSpv,  false);
+
+    // --- Descriptor pools and sets ---
+    // env_to_cube: 1 set; irradiance: 1 set; prefilter: kPrefMips sets (one per mip)
+    auto makePool = [&](VkDescriptorSetLayout layout, uint32_t nSets) -> VkDescriptorPool {
+        std::array<VkDescriptorPoolSize, 2> ps{{ { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nSets },
+                                                  { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, nSets } }};
+        VkDescriptorPoolCreateInfo pci{};
+        pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pci.poolSizeCount = 2;
+        pci.pPoolSizes    = ps.data();
+        pci.maxSets       = nSets;
+        VkDescriptorPool pool2 = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateDescriptorPool(dev, &pci, nullptr, &pool2));
+        (void)layout;
+        return pool2;
+    };
+
+    VkDescriptorPool envToCubePool  = makePool(envToCubePL.dsLayout,  1);
+    VkDescriptorPool prefilterPool  = makePool(prefilterPL.dsLayout,  kPrefMips);
+    VkDescriptorPool irradiancePool = makePool(irradiancePL.dsLayout, 1);
+
+    auto allocSets = [&](VkDescriptorPool p, VkDescriptorSetLayout layout,
+                         uint32_t n, std::vector<VkDescriptorSet>& sets) {
+        sets.resize(n);
+        std::vector<VkDescriptorSetLayout> layouts(n, layout);
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool     = p;
+        ai.descriptorSetCount = n;
+        ai.pSetLayouts        = layouts.data();
+        VK_CHECK(vkAllocateDescriptorSets(dev, &ai, sets.data()));
+    };
+
+    std::vector<VkDescriptorSet> envToCubeSets, prefilterSets, irradianceSets;
+    allocSets(envToCubePool,  envToCubePL.dsLayout,  1,         envToCubeSets);
+    allocSets(prefilterPool,  prefilterPL.dsLayout,  kPrefMips, prefilterSets);
+    allocSets(irradiancePool, irradiancePL.dsLayout, 1,         irradianceSets);
+
+    // Write env_to_cube descriptor (equirect → cube array storage)
+    {
+        VkDescriptorImageInfo in  = { m_sampler, m_envEquirectView,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo out = { VK_NULL_HANDLE, envCubeArrayView,
+                                      VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet w[2]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = envToCubeSets[0]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &in;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = envToCubeSets[0]; w[1].dstBinding = 1; w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &out;
+        vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
+    }
+
+    // Write prefilter descriptors (one per mip, each with its own mip-level storage view)
+    for (uint32_t mip = 0; mip < kPrefMips; ++mip) {
+        VkDescriptorImageInfo in  = { cubeSampler, m_envCubeView,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo out = { VK_NULL_HANDLE, m_prefilterMipViews[mip],
+                                      VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet w[2]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = prefilterSets[mip]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &in;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = prefilterSets[mip]; w[1].dstBinding = 1; w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &out;
+        vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
+    }
+
+    // Write irradiance descriptor
+    {
+        VkDescriptorImageInfo in  = { cubeSampler, m_envCubeView,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo out = { VK_NULL_HANDLE, irrArrayView,
+                                      VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet w[2]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = irradianceSets[0]; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &in;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = irradianceSets[0]; w[1].dstBinding = 1; w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &out;
+        vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
+    }
+
+    // --- Record and submit one command buffer for all IBL passes ---
+    auto cmd = m_ctx.beginSingleTimeCommands(pool);
+
+    auto imgBarrier = [&](VkImage img, uint32_t mips,
+                          VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                          VkImageLayout oldLayout, VkImageLayout newLayout,
+                          VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+        VkImageMemoryBarrier b{};
+        b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.srcAccessMask       = srcAccess;
+        b.dstAccessMask       = dstAccess;
+        b.oldLayout           = oldLayout;
+        b.newLayout           = newLayout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image               = img;
+        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 6 };
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    // Transition all outputs UNDEFINED → GENERAL for compute writes
+    imgBarrier(m_envCubeImg,    1,        0, VK_ACCESS_SHADER_WRITE_BIT,
+               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    imgBarrier(m_prefilterImg,  kPrefMips, 0, VK_ACCESS_SHADER_WRITE_BIT,
+               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    imgBarrier(m_irradianceImg, 1,        0, VK_ACCESS_SHADER_WRITE_BIT,
+               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    // Pass 1: env_to_cube — equirectangular → source cubemap
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, envToCubePL.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, envToCubePL.layout,
+                            0, 1, &envToCubeSets[0], 0, nullptr);
+    vkCmdDispatch(cmd, (kCubeSize + 15) / 16, (kCubeSize + 15) / 16, 6);
+
+    // Source cubemap GENERAL → SHADER_READ_ONLY for prefilter + irradiance reads
+    imgBarrier(m_envCubeImg, 1,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    // Pass 2: GGX prefilter — one dispatch per roughness mip
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prefilterPL.pipeline);
+    for (uint32_t mip = 0; mip < kPrefMips; ++mip) {
+        float    roughness = float(mip) / float(kPrefMips - 1);
+        uint32_t mipSize   = std::max(1u, kPrefSize >> mip);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prefilterPL.layout,
+                                0, 1, &prefilterSets[mip], 0, nullptr);
+        vkCmdPushConstants(cmd, prefilterPL.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(float), &roughness);
+        vkCmdDispatch(cmd, std::max(1u, (mipSize + 15) / 16),
+                           std::max(1u, (mipSize + 15) / 16), 6);
+    }
+
+    // Prefiltered cubemap GENERAL → SHADER_READ_ONLY
+    imgBarrier(m_prefilterImg, kPrefMips,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    // Pass 3: diffuse irradiance — hemisphere integration
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, irradiancePL.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, irradiancePL.layout,
+                            0, 1, &irradianceSets[0], 0, nullptr);
+    vkCmdDispatch(cmd, (kIrrSize + 15) / 16, (kIrrSize + 15) / 16, 6);
+
+    // Irradiance cubemap GENERAL → SHADER_READ_ONLY
+    imgBarrier(m_irradianceImg, 1,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    m_ctx.endSingleTimeCommands(pool, cmd);
+
+    // Cleanup temporary objects
+    vkDestroyDescriptorPool(dev, envToCubePool,  nullptr);
+    vkDestroyDescriptorPool(dev, prefilterPool,  nullptr);
+    vkDestroyDescriptorPool(dev, irradiancePool, nullptr);
+    vkDestroyImageView(dev, envCubeArrayView, nullptr);
+    vkDestroyImageView(dev, irrArrayView,     nullptr);
+    vkDestroySampler(dev, cubeSampler, nullptr);
+    destroyIBLPipeline(envToCubePL);
+    destroyIBLPipeline(prefilterPL);
+    destroyIBLPipeline(irradiancePL);
+
+    std::cout << "[PBR] IBL cubemaps built: "
+              << kCubeSize << "x" << kCubeSize << " source cube, "
+              << kPrefSize << "x" << kPrefSize << " prefiltered (" << kPrefMips << " mips), "
+              << kIrrSize << "x" << kIrrSize << " irradiance\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +1189,7 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
     }
 
     // Build and upload GPU-driven indirect command buffer
+    // STORAGE_BUFFER_BIT: cull compute shader reads from this as an SSBO
     {
         std::vector<VkDrawIndexedIndirectCommand> indirects(m_submeshes.size());
         for (size_t s = 0; s < m_submeshes.size(); ++s) {
@@ -823,14 +1201,74 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
         }
         VkDeviceSize indSize = m_submeshes.size() * sizeof(VkDrawIndexedIndirectCommand);
         m_indirectBuffer = std::make_unique<Buffer>(m_ctx, indSize,
-            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         m_indirectBuffer->upload(pool, indirects.data(), indSize);
+    }
+
+    // Build per-submesh world-space bounding spheres for GPU frustum culling.
+    // Apply the constant XPS model matrix (scale 0.01, rotate -90° X) at load time
+    // so the culling compute shader only needs the VP matrix.
+    {
+        // Model matrix transform (applied to local AABB centre and radius):
+        //   world.x = 0.01 * local.x
+        //   world.y = 0.01 * local.z    (Rx(-90): y' = z)
+        //   world.z = 0.01 * (-local.y) (Rx(-90): z' = -y)
+        const float kScale = 0.01f;
+        struct Sphere { float x, y, z, r; };
+        std::vector<Sphere> spheres(m_submeshes.size());
+
+        size_t globalVertBase = 0;
+        for (size_t s = 0; s < m_submeshes.size(); ++s) {
+            int32_t  vo   = m_submeshes[s].vertexOffset;
+            uint32_t ic   = m_submeshes[s].indexCount;
+            uint32_t fi   = m_submeshes[s].firstIndex;
+
+            float minX =  1e30f, maxX = -1e30f;
+            float minY =  1e30f, maxY = -1e30f;
+            float minZ =  1e30f, maxZ = -1e30f;
+
+            for (uint32_t idx = fi; idx < fi + ic; ++idx) {
+                uint32_t vi = allIndices[idx] + static_cast<uint32_t>(vo);
+                const float* p = allVerts[vi].pos;
+                if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+                if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1];
+                if (p[2] < minZ) minZ = p[2]; if (p[2] > maxZ) maxZ = p[2];
+            }
+            float cx = (minX + maxX) * 0.5f;
+            float cy = (minY + maxY) * 0.5f;
+            float cz = (minZ + maxZ) * 0.5f;
+
+            float radius = 0.0f;
+            for (uint32_t idx = fi; idx < fi + ic; ++idx) {
+                uint32_t vi = allIndices[idx] + static_cast<uint32_t>(vo);
+                const float* p = allVerts[vi].pos;
+                float dx = p[0]-cx, dy = p[1]-cy, dz = p[2]-cz;
+                float d2 = dx*dx + dy*dy + dz*dz;
+                if (d2 > radius) radius = d2;
+            }
+            radius = std::sqrt(radius);
+
+            // Transform to world space using the fixed model matrix
+            spheres[s].x = kScale * cx;
+            spheres[s].y = kScale * cz;    // Rx(-90): y' = z
+            spheres[s].z = kScale * (-cy); // Rx(-90): z' = -y
+            spheres[s].r = kScale * radius;
+        }
+
+        VkDeviceSize sphereSize = m_submeshes.size() * sizeof(Sphere);
+        m_sphereBuffer = std::make_unique<Buffer>(m_ctx, sphereSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        m_sphereBuffer->upload(pool, spheres.data(), sphereSize);
+        (void)globalVertBase;
     }
 
     // IBL resources (generated after sampler is ready)
     generateBRDFLut(pool);
     loadEnvMap(pool);
+    buildIBLCubemaps(pool);
 
     std::cout << "[PBR] Loaded '" << fs::path(fbxPath).filename().string() << "': "
               << m_submeshes.size() << " submeshes, "
@@ -857,7 +1295,7 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = nSets;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = nSets * kTotalTexBindings;  // 5 material + 2 IBL
+    poolSizes[1].descriptorCount = nSets * kTotalTexBindings;  // 5 material + 3 IBL
 
     VkDescriptorPoolCreateInfo pci{};
     pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -875,9 +1313,10 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
     m_descSets.resize(nSets);
     VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_descSets.data()));
 
-    // IBL views (fallback to white if not loaded)
-    VkImageView envView  = m_envView     ? m_envView     : m_fbWhiteView;
-    VkImageView brdfView = m_brdfLutView ? m_brdfLutView : m_fbWhiteView;
+    // IBL views — fall back to white if cubemap generation was skipped
+    VkImageView prefilterView  = m_prefilterView  ? m_prefilterView  : m_fbWhiteView;
+    VkImageView brdfView       = m_brdfLutView    ? m_brdfLutView    : m_fbWhiteView;
+    VkImageView irradianceView = m_irradianceView ? m_irradianceView : m_fbWhiteView;
 
     for (int s = 0; s < static_cast<int>(m_submeshes.size()); ++s) {
         int matIdx = m_submeshes[s].materialIdx;
@@ -904,9 +1343,10 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
                     ? view
                     : (t == kPBRNormal ? m_fbNormView : m_fbWhiteView);
             }
-            // Bindings 6-7: IBL (env map + BRDF LUT)
-            imgInfos[kPBRTexCount + 0] = { m_sampler, envView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            imgInfos[kPBRTexCount + 1] = { m_sampler, brdfView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            // Bindings 6-8: IBL (prefiltered specular cube, BRDF LUT, diffuse irradiance cube)
+            imgInfos[kPBRTexCount + 0] = { m_sampler, prefilterView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            imgInfos[kPBRTexCount + 1] = { m_sampler, brdfView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            imgInfos[kPBRTexCount + 2] = { m_sampler, irradianceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
 
             std::array<VkWriteDescriptorSet, 1 + kTotalTexBindings> writes{};
             writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -953,5 +1393,6 @@ VkDescriptorSet PBRModel::descriptorSet(int submeshIdx, int frameIdx) const {
 VkBuffer PBRModel::consolidatedVBO() const { return m_consolidatedVBO->handle(); }
 VkBuffer PBRModel::consolidatedIBO() const { return m_consolidatedIBO->handle(); }
 VkBuffer PBRModel::indirectBuffer()  const { return m_indirectBuffer->handle();  }
+VkBuffer PBRModel::sphereBuffer()    const { return m_sphereBuffer->handle();    }
 
 } // namespace tgt

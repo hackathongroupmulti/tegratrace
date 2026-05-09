@@ -14,9 +14,10 @@ layout(binding = 2) uniform sampler2D texNormal;
 layout(binding = 3) uniform sampler2D texRoughness;
 layout(binding = 4) uniform sampler2D texMetallic;
 layout(binding = 5) uniform sampler2D texAO;
-// IBL resources (bindings 6-7, shared across all submeshes)
-layout(binding = 6) uniform sampler2D texEnv;     // equirectangular environment map
-layout(binding = 7) uniform sampler2D texBrdfLut; // GGX split-sum LUT: (NdotV, roughness) -> (scale, bias)
+// IBL resources (bindings 6-8, shared across all submeshes)
+layout(binding = 6) uniform samplerCube texEnvPrefiltered; // GGX specular prefilter cubemap
+layout(binding = 7) uniform sampler2D   texBrdfLut;        // split-sum LUT: (NdotV, roughness) → (scale, bias)
+layout(binding = 8) uniform samplerCube texIrradiance;     // diffuse irradiance cubemap
 
 layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec2 fragUV;
@@ -49,12 +50,6 @@ float G_Smith(float NdotV, float NdotL, float roughness) {
 // Fresnel-Schlick approximation
 vec3 F_Schlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
-// Equirectangular UV from direction vector
-vec2 equirUV(vec3 dir) {
-    return vec2(atan(dir.z, dir.x) / (2.0 * PI) + 0.5,
-                acos(clamp(dir.y, -1.0, 1.0)) / PI);
 }
 
 void main() {
@@ -94,17 +89,17 @@ void main() {
     vec3 lightRad = ubo.lightColor.rgb * ubo.lightColor.w;
     vec3 Lo = (diffuse + specular) * lightRad * NdotL;
 
-    // IBL split-sum ambient (equirectangular env map + precomputed BRDF LUT)
+    // IBL split-sum ambient (cubemap IBL: prefiltered specular + diffuse irradiance)
     vec3 kS_ibl = F_Schlick(NdotV, F0);
     vec3 kD_ibl = (vec3(1.0) - kS_ibl) * (1.0 - metallic);
 
-    // Diffuse IBL: sample env map at N with high LOD to approximate irradiance convolution
-    vec3 irradiance = textureLod(texEnv, equirUV(N), 5.0).rgb;
+    // Diffuse IBL: sample precomputed irradiance cubemap at surface normal
+    vec3 irradiance = texture(texIrradiance, N).rgb;
     vec3 diffuseIBL = kD_ibl * irradiance * albedo;
 
-    // Specular IBL: sample env map at reflection direction, LOD controlled by roughness
+    // Specular IBL: sample GGX prefiltered cubemap; LOD selects roughness mip (0=mirror, 7=full diffuse)
     vec3 R = reflect(-V, N);
-    vec3 prefSpec = textureLod(texEnv, equirUV(R), roughness * 6.0).rgb;
+    vec3 prefSpec = textureLod(texEnvPrefiltered, R, roughness * 7.0).rgb;
 
     // BRDF LUT encodes (scale, bias) for the Fresnel term in split-sum form
     vec2 brdfSample = texture(texBrdfLut, vec2(NdotV, roughness)).rg;

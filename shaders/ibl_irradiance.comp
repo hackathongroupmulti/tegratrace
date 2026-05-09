@@ -1,0 +1,55 @@
+#version 450
+
+// Diffuse irradiance map: integrates incoming radiance over the hemisphere around N.
+// Dispatch: (irradianceSize/16, irradianceSize/16, 6)
+// Input: source cubemap (already converted from equirectangular).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform samplerCube uEnvMap;
+layout(binding = 1, rgba16f) uniform writeonly image2DArray uIrradiance;
+
+const float PI = 3.14159265359;
+
+vec3 faceDir(uint face, vec2 uv) {
+    switch (face) {
+        case 0u: return normalize(vec3( 1.0,  uv.y, -uv.x));
+        case 1u: return normalize(vec3(-1.0,  uv.y,  uv.x));
+        case 2u: return normalize(vec3( uv.x,  1.0, -uv.y));
+        case 3u: return normalize(vec3( uv.x, -1.0,  uv.y));
+        case 4u: return normalize(vec3( uv.x,  uv.y,  1.0));
+        default: return normalize(vec3(-uv.x,  uv.y, -1.0));
+    }
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    ivec2 size  = imageSize(uIrradiance).xy;
+    if (coord.x >= size.x || coord.y >= size.y) return;
+
+    vec2 uv = (vec2(coord.xy) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec3 N  = faceDir(uint(coord.z), uv);
+
+    // Build tangent frame around N
+    vec3 up    = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 right = normalize(cross(up, N));
+    up         = cross(N, right);
+
+    vec3  irradiance  = vec3(0.0);
+    float nSamples    = 0.0;
+    float sampleDelta = 0.05; // ~2π/0.05 ≈ 126 phi, π/2/0.05 ≈ 31 theta → ~3906 samples
+
+    for (float phi = 0.0; phi < 2.0 * PI; phi += sampleDelta) {
+        for (float theta = 0.0; theta < 0.5 * PI; theta += sampleDelta) {
+            float sinT = sin(theta);
+            float cosT = cos(theta);
+            vec3  sampleVec = cos(phi) * sinT * right
+                            + sin(phi) * sinT * up
+                            + cosT            * N;
+            irradiance += texture(uEnvMap, sampleVec).rgb * cosT * sinT;
+            nSamples   += 1.0;
+        }
+    }
+    irradiance = PI * irradiance / max(nSamples, 1.0);
+    imageStore(uIrradiance, coord, vec4(irradiance, 1.0));
+}

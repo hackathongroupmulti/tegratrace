@@ -3,6 +3,7 @@
 #include <set>
 #include <cstring>
 #include <iostream>
+#include <fstream>
 #include <algorithm>
 
 namespace tgt {
@@ -15,8 +16,9 @@ const std::vector<const char*> VulkanContext::kDeviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME
 };
 
-// Optional device extension checked and conditionally enabled at runtime
-static constexpr const char* kMemBudgetExt = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+// Optional device extensions
+static constexpr const char* kMemBudgetExt  = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+static constexpr const char* kPerfQueryExt  = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME;
 
 #define VK_CHECK(x) do { \
     VkResult _r = (x); \
@@ -31,6 +33,7 @@ VulkanContext::VulkanContext(bool enableValidation, bool headless)
 }
 
 VulkanContext::~VulkanContext() {
+    if (m_pipelineCache) vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
     if (m_device) vkDestroyDevice(m_device, nullptr);
     if (m_validation && m_debugMessenger) {
         auto fn = (PFN_vkDestroyDebugUtilsMessengerEXT)
@@ -206,10 +209,15 @@ void VulkanContext::createLogicalDevice() {
     features.samplerAnisotropy       = VK_TRUE;
     features.pipelineStatisticsQuery = VK_TRUE;
 
-    // Build device extension list: required + optional VK_EXT_memory_budget
+    // Build device extension list: required + optional extensions
     std::vector<const char*> devExts = m_headless
         ? std::vector<const char*>{}
         : kDeviceExtensions;
+
+    // VkPhysicalDevicePerformanceQueryFeaturesKHR for VK_KHR_performance_query
+    VkPhysicalDevicePerformanceQueryFeaturesKHR perfFeatures{};
+    perfFeatures.sType                   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR;
+    perfFeatures.performanceCounterQueryPools = VK_FALSE; // set true if supported
 
     {
         uint32_t count = 0;
@@ -217,11 +225,9 @@ void VulkanContext::createLogicalDevice() {
         std::vector<VkExtensionProperties> available(count);
         vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &count, available.data());
         for (auto& ext : available) {
-            if (std::string(ext.extensionName) == kMemBudgetExt) {
-                devExts.push_back(kMemBudgetExt);
-                m_memBudgetSupported = true;
-                break;
-            }
+            std::string name = ext.extensionName;
+            if (name == kMemBudgetExt) { devExts.push_back(kMemBudgetExt); m_memBudgetSupported = true; }
+            if (name == kPerfQueryExt) { devExts.push_back(kPerfQueryExt); perfFeatures.performanceCounterQueryPools = VK_TRUE; m_perfQuerySupported = true; }
         }
     }
 
@@ -232,6 +238,8 @@ void VulkanContext::createLogicalDevice() {
     ci.enabledExtensionCount   = static_cast<uint32_t>(devExts.size());
     ci.ppEnabledExtensionNames = devExts.empty() ? nullptr : devExts.data();
     ci.pEnabledFeatures        = &features;
+    if (m_perfQuerySupported)
+        ci.pNext = &perfFeatures;
     if (m_validation) {
         ci.enabledLayerCount   = static_cast<uint32_t>(kValidationLayers.size());
         ci.ppEnabledLayerNames = kValidationLayers.data();
@@ -241,9 +249,23 @@ void VulkanContext::createLogicalDevice() {
     vkGetDeviceQueue(m_device, m_queueFamilies.graphics.value(), 0, &m_graphicsQueue);
     vkGetDeviceQueue(m_device, m_queueFamilies.present.value(), 0, &m_presentQueue);
 
-    // Load Nsight/RenderDoc debug label function pointers (null-safe; no-ops if not present)
     loadDebugLabelFunctions();
 
+    // Create an initially-empty pipeline cache; caller can merge saved data via loadPipelineCache()
+    {
+        VkPipelineCacheCreateInfo pcci{};
+        pcci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        VK_CHECK(vkCreatePipelineCache(m_device, &pcci, nullptr, &m_pipelineCache));
+    }
+
+    if (m_perfQuerySupported) {
+        m_fnEnumPerfCounters =
+            (PFN_vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR)
+            vkGetInstanceProcAddr(m_instance,
+                "vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR");
+        enumeratePerfCounters();
+        std::cout << "[TegraTrace] VK_KHR_performance_query: " << m_perfCounters.size() << " counters\n";
+    }
     if (m_memBudgetSupported)
         std::cout << "[TegraTrace] VK_EXT_memory_budget enabled\n";
     if (m_fnBeginLabel)
@@ -427,6 +449,70 @@ void VulkanContext::insertDebugLabel(VkCommandBuffer cmd, const char* name,
     label.color[0]   = r; label.color[1] = g;
     label.color[2]   = b; label.color[3] = 1.0f;
     m_fnInsertLabel(cmd, &label);
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline cache: persist compiled SPIR-V → driver binary across runs
+// ---------------------------------------------------------------------------
+void VulkanContext::loadPipelineCache(const std::string& path) {
+    std::vector<uint8_t> data;
+    if (std::ifstream f(path, std::ios::binary | std::ios::ate); f) {
+        data.resize(static_cast<size_t>(f.tellg()));
+        f.seekg(0);
+        f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        std::cout << "[TegraTrace] Pipeline cache loaded (" << data.size() << " bytes)\n";
+    }
+    // Recreate with initial data (driver validates header; silently creates empty if invalid)
+    if (m_pipelineCache) vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
+    VkPipelineCacheCreateInfo ci{};
+    ci.sType           = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    ci.initialDataSize = data.size();
+    ci.pInitialData    = data.empty() ? nullptr : data.data();
+    VK_CHECK(vkCreatePipelineCache(m_device, &ci, nullptr, &m_pipelineCache));
+}
+
+void VulkanContext::savePipelineCache(const std::string& path) const {
+    if (!m_pipelineCache) return;
+    size_t size = 0;
+    vkGetPipelineCacheData(m_device, m_pipelineCache, &size, nullptr);
+    if (size == 0) return;
+    std::vector<uint8_t> data(size);
+    vkGetPipelineCacheData(m_device, m_pipelineCache, &size, data.data());
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(size));
+    std::cout << "[TegraTrace] Pipeline cache saved (" << size << " bytes)\n";
+}
+
+// ---------------------------------------------------------------------------
+// VK_KHR_performance_query: enumerate available GPU hardware counters
+// ---------------------------------------------------------------------------
+void VulkanContext::enumeratePerfCounters() {
+    if (!m_fnEnumPerfCounters) return;
+    uint32_t queueFamilyIndex = m_queueFamilies.graphics.value();
+    uint32_t counterCount = 0;
+    m_fnEnumPerfCounters(m_physicalDevice, queueFamilyIndex, &counterCount, nullptr, nullptr);
+    if (counterCount == 0) return;
+
+    std::vector<VkPerformanceCounterKHR>            counters(counterCount);
+    std::vector<VkPerformanceCounterDescriptionKHR> descs(counterCount);
+    for (auto& c : counters)
+        c.sType = VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_KHR;
+    for (auto& d : descs)
+        d.sType = VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_DESCRIPTION_KHR;
+
+    m_fnEnumPerfCounters(m_physicalDevice, queueFamilyIndex,
+                         &counterCount, counters.data(), descs.data());
+
+    m_perfCounters.clear();
+    m_perfCounters.reserve(counterCount);
+    for (uint32_t i = 0; i < counterCount; ++i) {
+        PerfCounter pc{};
+        pc.index       = i;
+        pc.name        = descs[i].name;
+        pc.category    = descs[i].category;
+        pc.description = descs[i].description;
+        m_perfCounters.push_back(std::move(pc));
+    }
 }
 
 } // namespace tgt

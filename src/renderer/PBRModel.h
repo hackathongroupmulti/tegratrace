@@ -18,9 +18,9 @@ static constexpr int kPBRNormal       = 1;  // binding 2: _N
 static constexpr int kPBRRoughness    = 2;  // binding 3: _R
 static constexpr int kPBRMetallic     = 3;  // binding 4: _M
 static constexpr int kPBRAO           = 4;  // binding 5: _AO
-// IBL textures (bindings 6-7, shared across all submeshes)
-static constexpr int kIBLTexCount     = 2;
-static constexpr int kTotalTexBindings = kPBRTexCount + kIBLTexCount;  // 7
+// IBL textures (bindings 6-8, shared across all submeshes)
+static constexpr int kIBLTexCount     = 3;
+static constexpr int kTotalTexBindings = kPBRTexCount + kIBLTexCount;  // 8
 
 // Matches the UBO layout in pbr.vert / pbr.frag
 struct PBRUBOData {
@@ -74,6 +74,7 @@ public:
     VkBuffer consolidatedVBO()   const;
     VkBuffer consolidatedIBO()   const;
     VkBuffer indirectBuffer()    const;
+    VkBuffer sphereBuffer()      const;  // per-submesh world-space bounding spheres (SSBO)
     uint32_t drawCount()         const { return static_cast<uint32_t>(m_submeshes.size()); }
 
 private:
@@ -91,9 +92,10 @@ private:
     void destroyMaterials();
     void destroyTextureCache();
 
-    // IBL: generate the GGX BRDF integration LUT (CPU) and load an env map from m_dir
+    // IBL: generate the GGX BRDF integration LUT (CPU) and produce cubemap resources from m_dir
     void generateBRDFLut(VkCommandPool pool);
-    void loadEnvMap(VkCommandPool pool);
+    void loadEnvMap(VkCommandPool pool);       // loads equirect HDR into m_envEquirectImg
+    void buildIBLCubemaps(VkCommandPool pool); // runs env_to_cube, prefilter, irradiance passes
 
     // Texture cache: resolved absolute path → GPU objects (shared across materials)
     struct CachedTexture {
@@ -118,21 +120,35 @@ private:
     VkDeviceMemory m_fbNormMem   = VK_NULL_HANDLE;
     VkImageView    m_fbNormView  = VK_NULL_HANDLE;
 
-    // IBL: equirectangular environment map (binding 6)
-    VkImage        m_envImg      = VK_NULL_HANDLE;
-    VkDeviceMemory m_envMem      = VK_NULL_HANDLE;
-    VkImageView    m_envView     = VK_NULL_HANDLE;
+    // IBL: equirectangular HDR source (intermediate; not bound to shader)
+    VkImage        m_envEquirectImg  = VK_NULL_HANDLE;
+    VkDeviceMemory m_envEquirectMem  = VK_NULL_HANDLE;
+    VkImageView    m_envEquirectView = VK_NULL_HANDLE;
+    // IBL: source cubemap converted from equirect (input to prefilter + irradiance passes)
+    VkImage        m_envCubeImg  = VK_NULL_HANDLE;
+    VkDeviceMemory m_envCubeMem  = VK_NULL_HANDLE;
+    VkImageView    m_envCubeView = VK_NULL_HANDLE; // full array view (samplerCube input)
+    // IBL: GGX specular prefiltered cubemap (binding 6)
+    VkImage        m_prefilterImg  = VK_NULL_HANDLE;
+    VkDeviceMemory m_prefilterMem  = VK_NULL_HANDLE;
+    VkImageView    m_prefilterView = VK_NULL_HANDLE;
+    std::vector<VkImageView> m_prefilterMipViews;  // per-mip storage views for compute writes
     // IBL: GGX BRDF integration LUT (binding 7)
     VkImage        m_brdfLutImg  = VK_NULL_HANDLE;
     VkDeviceMemory m_brdfLutMem  = VK_NULL_HANDLE;
     VkImageView    m_brdfLutView = VK_NULL_HANDLE;
+    // IBL: diffuse irradiance cubemap (binding 8)
+    VkImage        m_irradianceImg  = VK_NULL_HANDLE;
+    VkDeviceMemory m_irradianceMem  = VK_NULL_HANDLE;
+    VkImageView    m_irradianceView = VK_NULL_HANDLE;
 
     VkSampler m_sampler = VK_NULL_HANDLE;
 
     // GPU-driven indirect: single VBO/IBO for all submeshes + VkDrawIndexedIndirectCommand array
     std::unique_ptr<Buffer> m_consolidatedVBO;
     std::unique_ptr<Buffer> m_consolidatedIBO;
-    std::unique_ptr<Buffer> m_indirectBuffer;
+    std::unique_ptr<Buffer> m_indirectBuffer;  // source (also STORAGE for cull CS read)
+    std::unique_ptr<Buffer> m_sphereBuffer;    // per-submesh world-space bounding spheres
 
     // Per-frame UBO buffers
     std::vector<std::unique_ptr<Buffer>> m_uboBuffers;

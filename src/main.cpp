@@ -4,6 +4,7 @@
 #include "renderer/RenderPass.h"
 #include "renderer/Pipeline.h"
 #include "renderer/Renderer.h"
+#include "renderer/ShaderWatcher.h"
 #include "profiling/GPUProfiler.h"
 #include "ui/DebugUI.h"
 #include "capture/FrameCapture.h"
@@ -89,6 +90,7 @@ int main(int argc, char** argv) {
         if (!cfg.headless)
             surface = window->createSurface(ctx.instance());
         ctx.initSurface(surface);  // VK_NULL_HANDLE → headless device setup
+        ctx.loadPipelineCache(path("pipeline.cache"));
 
         // Inner scope: Vulkan objects destroyed before surface and instance
         {
@@ -103,11 +105,11 @@ int main(int argc, char** argv) {
             meshCfg.vertSpvPath = path("shaders/mesh.vert.spv");
             meshCfg.fragSpvPath = path("shaders/mesh.frag.spv");
 
-            // PBR pipeline: Cook-Torrance + 5 material maps + 2 IBL (env + BRDF LUT)
+            // PBR pipeline: Cook-Torrance + 5 material maps + 3 IBL (prefiltered, BRDF LUT, irradiance)
             tgt::PipelineConfig pbrCfg{};
             pbrCfg.vertSpvPath          = path("shaders/pbr.vert.spv");
             pbrCfg.fragSpvPath          = path("shaders/pbr.frag.spv");
-            pbrCfg.textureBindingCount  = 7;  // albedo, normal, roughness, metallic, AO, env, brdf_lut
+            pbrCfg.textureBindingCount  = 8;  // albedo, normal, roughness, metallic, AO, prefilter, brdf_lut, irradiance
             pbrCfg.usePBRVertex         = true;
             pbrCfg.cullMode             = VK_CULL_MODE_NONE; // double-sided for hair/cloth
 
@@ -119,8 +121,10 @@ int main(int argc, char** argv) {
             renderer.setMeshPipeline(&meshPipeline);
             renderer.setPBRPipeline(&pbrPipeline);
             renderer.loadMesh(cfg.meshPath);  // always loads sphere; OBJ if --mesh given
-            if (!cfg.fbxPath.empty())
+            if (!cfg.fbxPath.empty()) {
                 renderer.loadPBRModel(cfg.fbxPath);
+                renderer.setupCullPipeline(path("shaders/cull.comp.spv"));
+            }
 
             tgt::GPUProfiler      profiler(ctx, tgt::Swapchain::kMaxFramesInFlight);
             renderer.setProfiler(&profiler);
@@ -132,9 +136,21 @@ int main(int argc, char** argv) {
 
             std::string pendingReplay;  // set by UI replay panel, consumed after drawFrame
 
+            // Shader hot-reload: poll .spv timestamps every 60 frames
+            tgt::ShaderWatcher shaderWatcher;
+            shaderWatcher.watch(path("shaders/pbr.vert.spv"), &pbrPipeline);
+            shaderWatcher.watch(path("shaders/pbr.frag.spv"), &pbrPipeline);
+
             if (ui) {
                 ui->setSceneCallback([&](int s) { renderer.setScene(s); });
                 ui->setCapturesDir(path("captures"));
+                // Populate perf counter list from VK_KHR_performance_query enumeration
+                if (ctx.perfQuerySupported()) {
+                    std::vector<std::string> names;
+                    for (const auto& c : ctx.perfCounters())
+                        names.push_back("[" + c.category + "] " + c.name);
+                    ui->setPerfCounters(names);
+                }
 
                 // Replay triggered from the ImGui panel — deferred to after drawFrame
                 ui->setReplayCallback([&](const std::string& replayFile) {
@@ -317,6 +333,9 @@ int main(int argc, char** argv) {
                         renderer.setOrbitCamera(orbit.azimuth, orbit.elevation, orbit.radius);
                     }
 
+                    // Poll shader hot-reload every 60 frames
+                    if (frameNumber % 60 == 0) shaderWatcher.poll();
+
                     uint32_t renderedFrame = frameNumber;
                     bool ok = renderer.drawFrame(frameNumber);
                     frameNumber++;
@@ -354,6 +373,7 @@ int main(int argc, char** argv) {
             }
 
             renderer.waitIdle();
+            ctx.savePipelineCache(path("pipeline.cache"));
 
             metrics.printSummary();
             profiler.printSummary();

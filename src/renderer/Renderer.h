@@ -91,6 +91,8 @@ public:
     // Scene 3: PBR model (FBX via Assimp)
     void loadPBRModel(const std::string& fbxPath);
     void setPBRPipeline(Pipeline* p) { m_pbrPipeline = p; }
+    // Set up GPU frustum-culling compute pass (call after loadPBRModel).
+    void setupCullPipeline(const std::string& cullSpvPath);
     void setOrbitCamera(float azimuth, float elevation, float radius) {
         m_orbitAzimuth = azimuth; m_orbitElevation = elevation; m_orbitRadius = radius;
     }
@@ -157,6 +159,16 @@ private:
     float m_orbitAzimuth   = 0.0f;
     float m_orbitElevation = 0.25f;
     float m_orbitRadius    = 2.5f;
+
+    // GPU frustum-culling compute pipeline (set up after PBR model is loaded)
+    void destroyCullPipeline();
+    VkPipeline            m_cullPipeline  = VK_NULL_HANDLE;
+    VkPipelineLayout      m_cullLayout    = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_cullDSLayout  = VK_NULL_HANDLE;
+    VkDescriptorPool      m_cullDescPool  = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet>         m_cullDescSets;       // one per frame-in-flight
+    std::vector<std::unique_ptr<Buffer>> m_cullUBOBuffers;     // viewProj + drawCount per frame
+    std::vector<std::unique_ptr<Buffer>> m_culledIndirectBufs; // output per frame
 
     uint32_t m_lastImageIndex  = 0;
     uint32_t m_frameCount      = 0;

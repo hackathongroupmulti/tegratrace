@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <array>
 #include <vector>
 #include <iostream>
@@ -72,6 +73,7 @@ Renderer::Renderer(VulkanContext& ctx, Swapchain& swapchain,
 
 Renderer::~Renderer() {
     waitIdle();
+    destroyCullPipeline();
     vkDestroySampler(m_ctx.device(), m_sampler, nullptr);
     vkDestroyImageView(m_ctx.device(), m_textureView, nullptr);
     vkDestroyImage(m_ctx.device(), m_textureImage, nullptr);
@@ -394,6 +396,131 @@ void Renderer::loadPBRModel(const std::string& fbxPath) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU frustum culling compute pipeline
+// ---------------------------------------------------------------------------
+static VkShaderModule loadSpvModule(VkDevice device, const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("Cannot open shader: " + path);
+    size_t sz = static_cast<size_t>(f.tellg());
+    std::vector<char> buf(sz);
+    f.seekg(0);
+    f.read(buf.data(), static_cast<std::streamsize>(sz));
+    VkShaderModuleCreateInfo ci{};
+    ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = sz;
+    ci.pCode    = reinterpret_cast<const uint32_t*>(buf.data());
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &mod));
+    return mod;
+}
+
+void Renderer::destroyCullPipeline() {
+    m_cullDescSets.clear();
+    m_cullUBOBuffers.clear();
+    m_culledIndirectBufs.clear();
+    if (m_cullDescPool) { vkDestroyDescriptorPool(m_ctx.device(), m_cullDescPool, nullptr); m_cullDescPool = VK_NULL_HANDLE; }
+    if (m_cullPipeline) { vkDestroyPipeline(m_ctx.device(), m_cullPipeline, nullptr); m_cullPipeline = VK_NULL_HANDLE; }
+    if (m_cullLayout)   { vkDestroyPipelineLayout(m_ctx.device(), m_cullLayout, nullptr); m_cullLayout = VK_NULL_HANDLE; }
+    if (m_cullDSLayout) { vkDestroyDescriptorSetLayout(m_ctx.device(), m_cullDSLayout, nullptr); m_cullDSLayout = VK_NULL_HANDLE; }
+}
+
+void Renderer::setupCullPipeline(const std::string& cullSpvPath) {
+    if (!m_pbrModel || !m_pbrModel->isLoaded()) return;
+    destroyCullPipeline();
+
+    // Descriptor set layout: 3 SSBOs + 1 UBO
+    std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
+    for (int i = 0; i < 3; ++i) {
+        bindings[i].binding         = static_cast<uint32_t>(i);
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    bindings[3].binding        = 3;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[3].descriptorCount= 1;
+    bindings[3].stageFlags     = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dlci{};
+    dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dlci.bindingCount = 4;
+    dlci.pBindings    = bindings.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(m_ctx.device(), &dlci, nullptr, &m_cullDSLayout));
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts    = &m_cullDSLayout;
+    VK_CHECK(vkCreatePipelineLayout(m_ctx.device(), &plci, nullptr, &m_cullLayout));
+
+    VkShaderModule compMod = loadSpvModule(m_ctx.device(), cullSpvPath);
+    VkComputePipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = compMod;
+    cpci.stage.pName  = "main";
+    cpci.layout       = m_cullLayout;
+    VK_CHECK(vkCreateComputePipelines(m_ctx.device(), m_ctx.pipelineCache(), 1, &cpci, nullptr, &m_cullPipeline));
+    vkDestroyShaderModule(m_ctx.device(), compMod, nullptr);
+
+    constexpr int FIF = Swapchain::kMaxFramesInFlight;
+    uint32_t drawCount = m_pbrModel->drawCount();
+    VkDeviceSize indSize = drawCount * sizeof(VkDrawIndexedIndirectCommand);
+
+    // Descriptor pool (3 SSBO + 1 UBO) x FIF
+    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3u * FIF };
+    poolSizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u * FIF };
+    VkDescriptorPoolCreateInfo pci{};
+    pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes    = poolSizes.data();
+    pci.maxSets       = static_cast<uint32_t>(FIF);
+    VK_CHECK(vkCreateDescriptorPool(m_ctx.device(), &pci, nullptr, &m_cullDescPool));
+
+    std::vector<VkDescriptorSetLayout> layouts(FIF, m_cullDSLayout);
+    VkDescriptorSetAllocateInfo ai{};
+    ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool     = m_cullDescPool;
+    ai.descriptorSetCount = static_cast<uint32_t>(FIF);
+    ai.pSetLayouts        = layouts.data();
+    m_cullDescSets.resize(FIF);
+    VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_cullDescSets.data()));
+
+    // Per-frame UBO and culled indirect buffers; write descriptor sets
+    struct CullParams { float viewProj[16]; uint32_t drawCount; uint32_t pad[3]; };
+    for (int f = 0; f < FIF; ++f) {
+        m_cullUBOBuffers.push_back(std::make_unique<Buffer>(m_ctx, sizeof(CullParams),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+        m_culledIndirectBufs.push_back(std::make_unique<Buffer>(m_ctx, indSize,
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+
+        VkDescriptorBufferInfo srcInfo{ m_pbrModel->indirectBuffer(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo dstInfo{ m_culledIndirectBufs[f]->handle(), 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo sphInfo{ m_pbrModel->sphereBuffer(),   0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo uboInfo{ m_cullUBOBuffers[f]->handle(), 0, sizeof(CullParams) };
+
+        std::array<VkWriteDescriptorSet, 4> writes{};
+        for (int i = 0; i < 4; ++i) {
+            writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet          = m_cullDescSets[f];
+            writes[i].dstBinding      = static_cast<uint32_t>(i);
+            writes[i].descriptorCount = 1;
+        }
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[0].pBufferInfo = &srcInfo;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[1].pBufferInfo = &dstInfo;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[2].pBufferInfo = &sphInfo;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[3].pBufferInfo = &uboInfo;
+        vkUpdateDescriptorSets(m_ctx.device(), 4, writes.data(), 0, nullptr);
+    }
+    std::cout << "[Renderer] GPU frustum-culling compute pipeline ready ("
+              << drawCount << " submeshes)\n";
+}
+
 void Renderer::updateUniformBuffer(uint32_t frame, uint32_t frameNumber) {
     UniformBufferObject ubo{};
 
@@ -540,6 +667,35 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
 
     // ---- Scene 3: PBR multi-submesh model — GPU-driven indirect ----
     if (isPBRScene) {
+        // GPU frustum culling: run compute outside the render pass, then barrier
+        if (m_cullPipeline && !m_culledIndirectBufs.empty()) {
+            uint32_t fi2 = profIdx; // same slot as profIdx
+            // Update frustum cull UBO (viewProj matrix + drawCount)
+            struct CullParams { float viewProj[16]; uint32_t drawCount; uint32_t pad[3]; };
+            glm::mat4 vp = glm::make_mat4(m_currentProj) * glm::make_mat4(m_currentView);
+            CullParams cp{};
+            std::memcpy(cp.viewProj, glm::value_ptr(vp), 64);
+            cp.drawCount = m_pbrModel->drawCount();
+            m_cullUBOBuffers[fi2]->writeHostVisible(&cp, sizeof(cp));
+
+            // Dispatch: 1 workgroup per 64 submeshes (cull.comp local_size_x=64)
+            uint32_t groups = (cp.drawCount + 63) / 64;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cullPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                m_cullLayout, 0, 1, &m_cullDescSets[fi2], 0, nullptr);
+            vkCmdDispatch(cmd, groups, 1, 1);
+
+            // Barrier: compute SSBO write → indirect draw read
+            VkMemoryBarrier mb{};
+            mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+
         m_lastDrawCalls.clear();
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pbrPipeline->handle());
 
@@ -573,8 +729,11 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
             vkCmdPushConstants(cmd, m_pbrPipeline->layout(),
                 VK_SHADER_STAGE_VERTEX_BIT, 0, 64, glm::value_ptr(modelMat));
 
-            // GPU-driven: draw parameters read from the indirect buffer (GPU memory)
-            vkCmdDrawIndexedIndirect(cmd, m_pbrModel->indirectBuffer(),
+            // GPU-driven: draw from culled buffer if compute cull is active
+            VkBuffer indBuf = (!m_culledIndirectBufs.empty())
+                ? m_culledIndirectBufs[profIdx]->handle()
+                : m_pbrModel->indirectBuffer();
+            vkCmdDrawIndexedIndirect(cmd, indBuf,
                 static_cast<VkDeviceSize>(s) * sizeof(VkDrawIndexedIndirectCommand),
                 1, sizeof(VkDrawIndexedIndirectCommand));
 

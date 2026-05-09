@@ -148,6 +148,10 @@ if(GLSLC)
     compile_shader(tegratrace shaders/cube_field.vert)
     compile_shader(tegratrace shaders/pbr.vert)
     compile_shader(tegratrace shaders/pbr.frag)
+    compile_shader(tegratrace shaders/cull.comp)
+    compile_shader(tegratrace shaders/env_to_cube.comp)
+    compile_shader(tegratrace shaders/ibl_prefilter.comp)
+    compile_shader(tegratrace shaders/ibl_irradiance.comp)
     add_custom_command(TARGET tegratrace POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_BINARY_DIR}/shaders"
