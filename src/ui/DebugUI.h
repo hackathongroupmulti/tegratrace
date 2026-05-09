@@ -24,22 +24,26 @@ struct UIFrameData {
     float       fps             = 0.0f;
     float       cpuFrameMs      = 0.0f;
     float       gpuFrameMs      = 0.0f;
-    float       barrierMs       = 0.0f;  // pipeline barrier probe timing
-    float       jitterMs        = 0.0f;  // frame-to-frame GPU time deviation
-    bool        syncSuspected   = false; // jitter spike detected
+    float       barrierMs       = 0.0f;
+    float       jitterMs        = 0.0f;
+    bool        syncSuspected   = false;
     uint32_t    spikeCount      = 0;
     uint32_t    drawCalls       = 0;
     uint64_t    vsInvocations   = 0;
     uint64_t    fsInvocations   = 0;
     uint64_t    iaPrimitives    = 0;
     uint64_t    clippingPrims   = 0;
-    float       overdrawRatio   = 0.0f;  // fsInvocations / viewport pixels
+    float       overdrawRatio   = 0.0f;
     std::string pipelineName;
-    std::vector<DrawCallSummary> drawCallList;  // submission-order draw list
+    std::vector<DrawCallSummary> drawCallList;
 
     // Per-submesh GPU timings (scene 3 only)
     struct SubmeshTiming { std::string name; float gpuMs = 0.0f; };
     std::vector<SubmeshTiming> submeshTimings;
+
+    // VK_EXT_memory_budget: per-heap VRAM budget and usage (MiB)
+    struct HeapBudget { float budgetMiB = 0.0f; float usedMiB = 0.0f; };
+    std::vector<HeapBudget> vramHeaps;
 };
 
 class DebugUI {
@@ -75,6 +79,7 @@ private:
     void panelCommandBufferInspector(const UIFrameData& data);
     void panelReplayControls();
     void panelSubmeshTimings(const UIFrameData& data);
+    void panelVRAMBudget(const UIFrameData& data);
     void scanCaptureFiles();
 
     VulkanContext&   m_ctx;

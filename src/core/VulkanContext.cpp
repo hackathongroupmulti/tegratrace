@@ -15,6 +15,9 @@ const std::vector<const char*> VulkanContext::kDeviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME
 };
 
+// Optional device extension checked and conditionally enabled at runtime
+static constexpr const char* kMemBudgetExt = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+
 #define VK_CHECK(x) do { \
     VkResult _r = (x); \
     if (_r != VK_SUCCESS) throw std::runtime_error(std::string(#x " failed: ") + std::to_string(_r)); \
@@ -64,8 +67,8 @@ void VulkanContext::createInstance() {
         extensions.push_back("VK_KHR_xcb_surface");
 #endif
     }
-    if (m_validation)
-        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    // Always request debug utils so Nsight/RenderDoc labels work even in release builds
+    extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
     VkInstanceCreateInfo ci{};
     ci.sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -95,6 +98,15 @@ void VulkanContext::setupDebugMessenger() {
         vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT");
     if (!fn) throw std::runtime_error("vkCreateDebugUtilsMessengerEXT not found");
     VK_CHECK(fn(m_instance, &ci, nullptr, &m_debugMessenger));
+}
+
+void VulkanContext::loadDebugLabelFunctions() {
+    m_fnBeginLabel  = (PFN_vkCmdBeginDebugUtilsLabelEXT)
+        vkGetDeviceProcAddr(m_device, "vkCmdBeginDebugUtilsLabelEXT");
+    m_fnEndLabel    = (PFN_vkCmdEndDebugUtilsLabelEXT)
+        vkGetDeviceProcAddr(m_device, "vkCmdEndDebugUtilsLabelEXT");
+    m_fnInsertLabel = (PFN_vkCmdInsertDebugUtilsLabelEXT)
+        vkGetDeviceProcAddr(m_device, "vkCmdInsertDebugUtilsLabelEXT");
 }
 
 void VulkanContext::pickPhysicalDevice() {
@@ -191,17 +203,34 @@ void VulkanContext::createLogicalDevice() {
     }
 
     VkPhysicalDeviceFeatures features{};
-    features.samplerAnisotropy    = VK_TRUE;
+    features.samplerAnisotropy       = VK_TRUE;
     features.pipelineStatisticsQuery = VK_TRUE;
+
+    // Build device extension list: required + optional VK_EXT_memory_budget
+    std::vector<const char*> devExts = m_headless
+        ? std::vector<const char*>{}
+        : kDeviceExtensions;
+
+    {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> available(count);
+        vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &count, available.data());
+        for (auto& ext : available) {
+            if (std::string(ext.extensionName) == kMemBudgetExt) {
+                devExts.push_back(kMemBudgetExt);
+                m_memBudgetSupported = true;
+                break;
+            }
+        }
+    }
 
     VkDeviceCreateInfo ci{};
     ci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     ci.queueCreateInfoCount    = static_cast<uint32_t>(queueCIs.size());
     ci.pQueueCreateInfos       = queueCIs.data();
-    if (!m_headless) {
-        ci.enabledExtensionCount   = static_cast<uint32_t>(kDeviceExtensions.size());
-        ci.ppEnabledExtensionNames = kDeviceExtensions.data();
-    }
+    ci.enabledExtensionCount   = static_cast<uint32_t>(devExts.size());
+    ci.ppEnabledExtensionNames = devExts.empty() ? nullptr : devExts.data();
     ci.pEnabledFeatures        = &features;
     if (m_validation) {
         ci.enabledLayerCount   = static_cast<uint32_t>(kValidationLayers.size());
@@ -211,6 +240,14 @@ void VulkanContext::createLogicalDevice() {
     VK_CHECK(vkCreateDevice(m_physicalDevice, &ci, nullptr, &m_device));
     vkGetDeviceQueue(m_device, m_queueFamilies.graphics.value(), 0, &m_graphicsQueue);
     vkGetDeviceQueue(m_device, m_queueFamilies.present.value(), 0, &m_presentQueue);
+
+    // Load Nsight/RenderDoc debug label function pointers (null-safe; no-ops if not present)
+    loadDebugLabelFunctions();
+
+    if (m_memBudgetSupported)
+        std::cout << "[TegraTrace] VK_EXT_memory_budget enabled\n";
+    if (m_fnBeginLabel)
+        std::cout << "[TegraTrace] VkCmdDebugUtilsLabel functions loaded (Nsight/RenderDoc ready)\n";
 }
 
 SwapchainSupportDetails VulkanContext::querySwapchainSupport(VkSurfaceKHR surface) const {
@@ -337,6 +374,59 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
         ctx->m_validationLog.push_back(std::move(msg));
     }
     return VK_FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// VK_EXT_memory_budget: per-heap VRAM budget and usage
+// ---------------------------------------------------------------------------
+MemoryBudget VulkanContext::queryMemoryBudget() const {
+    MemoryBudget result{};
+    if (!m_memBudgetSupported) return result;
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProps{};
+    budgetProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+
+    VkPhysicalDeviceMemoryProperties2 memProps2{};
+    memProps2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    memProps2.pNext = &budgetProps;
+    vkGetPhysicalDeviceMemoryProperties2(m_physicalDevice, &memProps2);
+
+    result.supported  = true;
+    result.heapCount  = memProps2.memoryProperties.memoryHeapCount;
+    for (uint32_t i = 0; i < result.heapCount; ++i) {
+        result.budget[i] = budgetProps.heapBudget[i];
+        result.usage[i]  = budgetProps.heapUsage[i];
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Debug label wrappers — null-safe; no-ops when extension is not present
+// ---------------------------------------------------------------------------
+void VulkanContext::beginDebugLabel(VkCommandBuffer cmd, const char* name,
+                                    float r, float g, float b) const {
+    if (!m_fnBeginLabel) return;
+    VkDebugUtilsLabelEXT label{};
+    label.sType      = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    label.color[0]   = r; label.color[1] = g;
+    label.color[2]   = b; label.color[3] = 1.0f;
+    m_fnBeginLabel(cmd, &label);
+}
+
+void VulkanContext::endDebugLabel(VkCommandBuffer cmd) const {
+    if (m_fnEndLabel) m_fnEndLabel(cmd);
+}
+
+void VulkanContext::insertDebugLabel(VkCommandBuffer cmd, const char* name,
+                                     float r, float g, float b) const {
+    if (!m_fnInsertLabel) return;
+    VkDebugUtilsLabelEXT label{};
+    label.sType      = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    label.color[0]   = r; label.color[1] = g;
+    label.color[2]   = b; label.color[3] = 1.0f;
+    m_fnInsertLabel(cmd, &label);
 }
 
 } // namespace tgt

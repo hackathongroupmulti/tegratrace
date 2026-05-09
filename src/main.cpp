@@ -103,11 +103,11 @@ int main(int argc, char** argv) {
             meshCfg.vertSpvPath = path("shaders/mesh.vert.spv");
             meshCfg.fragSpvPath = path("shaders/mesh.frag.spv");
 
-            // PBR pipeline: Cook-Torrance + 5 texture maps, PBRVertex layout, double-sided
+            // PBR pipeline: Cook-Torrance + 5 material maps + 2 IBL (env + BRDF LUT)
             tgt::PipelineConfig pbrCfg{};
             pbrCfg.vertSpvPath          = path("shaders/pbr.vert.spv");
             pbrCfg.fragSpvPath          = path("shaders/pbr.frag.spv");
-            pbrCfg.textureBindingCount  = 5;  // albedo, normal, roughness, metallic, AO
+            pbrCfg.textureBindingCount  = 7;  // albedo, normal, roughness, metallic, AO, env, brdf_lut
             pbrCfg.usePBRVertex         = true;
             pbrCfg.cullMode             = VK_CULL_MODE_NONE; // double-sided for hair/cloth
 
@@ -194,6 +194,18 @@ int main(int argc, char** argv) {
                         data.pipelineName = (cfg.scene == 3) ? pbrPipeline.name()
                                           : (cfg.scene == 2) ? meshPipeline.name()
                                           : pipeline.name();
+                        // VK_EXT_memory_budget: per-heap VRAM usage
+                        {
+                            auto budget = ctx.queryMemoryBudget();
+                            if (budget.supported) {
+                                for (uint32_t h = 0; h < budget.heapCount; ++h) {
+                                    tgt::UIFrameData::HeapBudget hb{};
+                                    hb.budgetMiB = static_cast<float>(budget.budget[h]) / (1024.0f * 1024.0f);
+                                    hb.usedMiB   = static_cast<float>(budget.usage[h])  / (1024.0f * 1024.0f);
+                                    data.vramHeaps.push_back(hb);
+                                }
+                            }
+                        }
                         // Per-pass breakdown
                         for (auto& pass : rep.passes) {
                             if (pass.name == "barrier") {

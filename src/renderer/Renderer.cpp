@@ -538,7 +538,7 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
         vkCmdBindIndexBuffer(cmd, m_meshIndexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
     }
 
-    // ---- Scene 3: PBR multi-submesh model ----
+    // ---- Scene 3: PBR multi-submesh model — GPU-driven indirect ----
     if (isPBRScene) {
         m_lastDrawCalls.clear();
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pbrPipeline->handle());
@@ -547,12 +547,24 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
         glm::mat4 modelMat = glm::scale(glm::mat4(1.0f), glm::vec3(0.01f));
         modelMat = glm::rotate(modelMat, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
 
+        // Bind consolidated VBO/IBO once for all submeshes (GPU-driven geometry)
+        VkBuffer     cvbo    = m_pbrModel->consolidatedVBO();
+        VkDeviceSize vbOff   = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &cvbo, &vbOff);
+        vkCmdBindIndexBuffer(cmd, m_pbrModel->consolidatedIBO(), 0, VK_INDEX_TYPE_UINT32);
+
         uint32_t fi = frameIdx % Swapchain::kMaxFramesInFlight;
+
+        m_ctx.beginDebugLabel(cmd, "PBR_Model", 0.2f, 0.8f, 0.4f);
+
         for (int s = 0; s < static_cast<int>(m_pbrModel->submeshes().size()); ++s) {
             const auto& sub = m_pbrModel->submeshes()[s];
 
             std::string passName = "sub:" + (sub.name.empty() ? std::to_string(s) : sub.name);
             if (m_profiler) m_profiler->beginPass(cmd, profIdx, passName);
+
+            // Nsight/RenderDoc: each submesh gets its own colour-coded label
+            m_ctx.beginDebugLabel(cmd, passName.c_str(), 0.4f, 0.6f, 1.0f);
 
             VkDescriptorSet ds = m_pbrModel->descriptorSet(s, fi);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -561,11 +573,12 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
             vkCmdPushConstants(cmd, m_pbrPipeline->layout(),
                 VK_SHADER_STAGE_VERTEX_BIT, 0, 64, glm::value_ptr(modelMat));
 
-            VkBuffer     vbuf   = sub.vertexBuffer->handle();
-            VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &offset);
-            vkCmdBindIndexBuffer(cmd, sub.indexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, sub.indexCount, 1, 0, 0, 0);
+            // GPU-driven: draw parameters read from the indirect buffer (GPU memory)
+            vkCmdDrawIndexedIndirect(cmd, m_pbrModel->indirectBuffer(),
+                static_cast<VkDeviceSize>(s) * sizeof(VkDrawIndexedIndirectCommand),
+                1, sizeof(VkDrawIndexedIndirectCommand));
+
+            m_ctx.endDebugLabel(cmd);
 
             if (m_profiler) m_profiler->endPass(cmd, profIdx);
 
@@ -589,6 +602,8 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
             }
         }
 
+        m_ctx.endDebugLabel(cmd);  // end PBR_Model
+
         if (m_captureCallback && !m_lastDrawCalls.empty())
             m_captureCallback(frameNumber, m_lastDrawCalls);
 
@@ -606,7 +621,7 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                 0, 1, &mb, 0, nullptr, 0, nullptr);
         }
-        if (m_profiler) m_profiler->endPass(cmd, profIdx);  // end "barrier"
+        if (m_profiler) m_profiler->endPass(cmd, profIdx);
         if (m_profiler) m_profiler->endPipelineStats(cmd, profIdx);
         VK_CHECK(vkEndCommandBuffer(cmd));
         return cmd;

@@ -11,13 +11,16 @@ namespace tgt {
 class VulkanContext;
 class Buffer;
 
-// Indices into the per-material texture array
+// Indices into the per-material texture array (bindings 1-5 in the shader)
 static constexpr int kPBRTexCount     = 5;
-static constexpr int kPBRAlbedo       = 0;  // _D
-static constexpr int kPBRNormal       = 1;  // _N
-static constexpr int kPBRRoughness    = 2;  // _R
-static constexpr int kPBRMetallic     = 3;  // _M
-static constexpr int kPBRAO           = 4;  // _AO
+static constexpr int kPBRAlbedo       = 0;  // binding 1: _D
+static constexpr int kPBRNormal       = 1;  // binding 2: _N
+static constexpr int kPBRRoughness    = 2;  // binding 3: _R
+static constexpr int kPBRMetallic     = 3;  // binding 4: _M
+static constexpr int kPBRAO           = 4;  // binding 5: _AO
+// IBL textures (bindings 6-7, shared across all submeshes)
+static constexpr int kIBLTexCount     = 2;
+static constexpr int kTotalTexBindings = kPBRTexCount + kIBLTexCount;  // 7
 
 // Matches the UBO layout in pbr.vert / pbr.frag
 struct PBRUBOData {
@@ -34,11 +37,12 @@ struct PBRMaterial {
     bool        hasMap[kPBRTexCount] = {};
 };
 
+// GPU-driven: stores offsets into consolidated VBO/IBO instead of owning buffers
 struct PBRSubmesh {
-    std::unique_ptr<Buffer> vertexBuffer;
-    std::unique_ptr<Buffer> indexBuffer;
-    uint32_t    indexCount  = 0;
-    int         materialIdx = -1;
+    uint32_t    indexCount    = 0;
+    uint32_t    firstIndex    = 0;   // byte offset into consolidated IBO (in indices)
+    int32_t     vertexOffset  = 0;   // vertex index added to each index (into consolidated VBO)
+    int         materialIdx   = -1;
     std::string name;
 };
 
@@ -66,8 +70,14 @@ public:
     const std::vector<PBRSubmesh>& submeshes() const { return m_submeshes; }
     bool isLoaded() const { return !m_submeshes.empty(); }
 
+    // GPU-driven indirect: consolidated geometry buffers + indirect draw commands
+    VkBuffer consolidatedVBO()   const;
+    VkBuffer consolidatedIBO()   const;
+    VkBuffer indirectBuffer()    const;
+    uint32_t drawCount()         const { return static_cast<uint32_t>(m_submeshes.size()); }
+
 private:
-    // Load a texture from disk, upload to GPU; returns VK_NULL_HANDLE on failure
+    // Load a texture from disk, upload to GPU with full mip chain; returns VK_NULL_HANDLE on failure
     VkImageView loadTextureFile(const std::string& path, bool srgb,
                                 VkImage& outImage, VkDeviceMemory& outMem,
                                 VkCommandPool pool);
@@ -80,6 +90,10 @@ private:
 
     void destroyMaterials();
     void destroyTextureCache();
+
+    // IBL: generate the GGX BRDF integration LUT (CPU) and load an env map from m_dir
+    void generateBRDFLut(VkCommandPool pool);
+    void loadEnvMap(VkCommandPool pool);
 
     // Texture cache: resolved absolute path → GPU objects (shared across materials)
     struct CachedTexture {
@@ -96,15 +110,29 @@ private:
     std::vector<PBRMaterial> m_materials;
 
     // Fallback: solid white (for albedo/roughness/metallic/AO)
-    VkImage        m_fbWhiteImg = VK_NULL_HANDLE;
-    VkDeviceMemory m_fbWhiteMem = VK_NULL_HANDLE;
+    VkImage        m_fbWhiteImg  = VK_NULL_HANDLE;
+    VkDeviceMemory m_fbWhiteMem  = VK_NULL_HANDLE;
     VkImageView    m_fbWhiteView = VK_NULL_HANDLE;
     // Fallback: flat normal {128,128,255} → (0,0,1) in tangent space
-    VkImage        m_fbNormImg  = VK_NULL_HANDLE;
-    VkDeviceMemory m_fbNormMem  = VK_NULL_HANDLE;
-    VkImageView    m_fbNormView = VK_NULL_HANDLE;
+    VkImage        m_fbNormImg   = VK_NULL_HANDLE;
+    VkDeviceMemory m_fbNormMem   = VK_NULL_HANDLE;
+    VkImageView    m_fbNormView  = VK_NULL_HANDLE;
+
+    // IBL: equirectangular environment map (binding 6)
+    VkImage        m_envImg      = VK_NULL_HANDLE;
+    VkDeviceMemory m_envMem      = VK_NULL_HANDLE;
+    VkImageView    m_envView     = VK_NULL_HANDLE;
+    // IBL: GGX BRDF integration LUT (binding 7)
+    VkImage        m_brdfLutImg  = VK_NULL_HANDLE;
+    VkDeviceMemory m_brdfLutMem  = VK_NULL_HANDLE;
+    VkImageView    m_brdfLutView = VK_NULL_HANDLE;
 
     VkSampler m_sampler = VK_NULL_HANDLE;
+
+    // GPU-driven indirect: single VBO/IBO for all submeshes + VkDrawIndexedIndirectCommand array
+    std::unique_ptr<Buffer> m_consolidatedVBO;
+    std::unique_ptr<Buffer> m_consolidatedIBO;
+    std::unique_ptr<Buffer> m_indirectBuffer;
 
     // Per-frame UBO buffers
     std::vector<std::unique_ptr<Buffer>> m_uboBuffers;

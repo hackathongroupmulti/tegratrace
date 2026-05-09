@@ -87,6 +87,7 @@ void DebugUI::buildPanels(const UIFrameData& data) {
     panelPipelineInspector(data);
     panelValidationLog();
     panelSceneControl();
+    panelVRAMBudget(data);
 
     // Right column (x=330)
     panelCommandBufferInspector(data);
@@ -134,6 +135,28 @@ void DebugUI::panelPipelineStats(const UIFrameData& data) {
     ImGui::Separator();
     if (data.overdrawRatio >= 0.0f)
         ImGui::Text("Overdraw ratio   %.2fx", data.overdrawRatio);
+    ImGui::End();
+}
+
+void DebugUI::panelVRAMBudget(const UIFrameData& data) {
+    if (data.vramHeaps.empty()) return;
+    ImGui::SetNextWindowPos({10, 770}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 75}, ImGuiCond_Once);
+    ImGui::Begin("VRAM Budget");
+    for (int i = 0; i < static_cast<int>(data.vramHeaps.size()); ++i) {
+        auto& h = data.vramHeaps[i];
+        if (h.budgetMiB < 1.0f) continue;
+        float frac = (h.budgetMiB > 0.0f) ? h.usedMiB / h.budgetMiB : 0.0f;
+        char overlay[48];
+        std::snprintf(overlay, sizeof(overlay), "Heap%d  %.0f / %.0f MiB",
+                      i, h.usedMiB, h.budgetMiB);
+        ImVec4 barCol = (frac > 0.85f)
+            ? ImVec4{1.0f, 0.3f, 0.3f, 1.0f}
+            : ImVec4{0.3f, 0.8f, 0.3f, 1.0f};
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barCol);
+        ImGui::ProgressBar(frac, {-1, 16}, overlay);
+        ImGui::PopStyleColor();
+    }
     ImGui::End();
 }
 

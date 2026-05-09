@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -31,7 +32,6 @@ namespace tgt {
 PBRModel::PBRModel(VulkanContext& ctx) : m_ctx(ctx) {}
 
 PBRModel::~PBRModel() {
-    // Wait for GPU before releasing any resource
     vkDeviceWaitIdle(m_ctx.device());
 
     if (m_descPool) vkDestroyDescriptorPool(m_ctx.device(), m_descPool, nullptr);
@@ -40,6 +40,10 @@ PBRModel::~PBRModel() {
     destroyMaterials();
     destroyTextureCache();
     m_submeshes.clear();
+
+    m_consolidatedVBO.reset();
+    m_consolidatedIBO.reset();
+    m_indirectBuffer.reset();
 
     // Fallback textures
     if (m_fbWhiteView) vkDestroyImageView(m_ctx.device(), m_fbWhiteView, nullptr);
@@ -50,11 +54,20 @@ PBRModel::~PBRModel() {
     if (m_fbNormImg)   vkDestroyImage(m_ctx.device(), m_fbNormImg, nullptr);
     if (m_fbNormMem)   vkFreeMemory(m_ctx.device(), m_fbNormMem, nullptr);
 
+    // IBL textures
+    if (m_envView)     vkDestroyImageView(m_ctx.device(), m_envView, nullptr);
+    if (m_envImg)      vkDestroyImage(m_ctx.device(), m_envImg, nullptr);
+    if (m_envMem)      vkFreeMemory(m_ctx.device(), m_envMem, nullptr);
+
+    if (m_brdfLutView) vkDestroyImageView(m_ctx.device(), m_brdfLutView, nullptr);
+    if (m_brdfLutImg)  vkDestroyImage(m_ctx.device(), m_brdfLutImg, nullptr);
+    if (m_brdfLutMem)  vkFreeMemory(m_ctx.device(), m_brdfLutMem, nullptr);
+
     if (m_sampler) vkDestroySampler(m_ctx.device(), m_sampler, nullptr);
 }
 
 void PBRModel::destroyMaterials() {
-    m_materials.clear();  // views are borrowed from m_texCache; cache owns the GPU objects
+    m_materials.clear();  // views borrowed from cache; cache owns the GPU objects
 }
 
 void PBRModel::destroyTextureCache() {
@@ -67,7 +80,7 @@ void PBRModel::destroyTextureCache() {
 }
 
 // ---------------------------------------------------------------------------
-// Small helper: upload a 1×1 RGBA8 pixel to a new device-local image
+// Upload a 1×1 RGBA8 pixel to a new device-local image (for fallback textures)
 // ---------------------------------------------------------------------------
 static VkImageView makeSmallTexture(VulkanContext& ctx, VkCommandPool pool,
                                     uint8_t pr, uint8_t pg, uint8_t pb, uint8_t pa,
@@ -91,7 +104,8 @@ static VkImageView makeSmallTexture(VulkanContext& ctx, VkCommandPool pool,
     ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.samples       = VK_SAMPLE_COUNT_1_BIT;
     ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateImage(ctx.device(), &ici, nullptr, &outImg));
+    VkResult r = vkCreateImage(ctx.device(), &ici, nullptr, &outImg);
+    if (r != VK_SUCCESS) throw std::runtime_error("vkCreateImage failed");
 
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(ctx.device(), outImg, &req);
@@ -99,7 +113,7 @@ static VkImageView makeSmallTexture(VulkanContext& ctx, VkCommandPool pool,
     mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize  = req.size;
     mai.memoryTypeIndex = ctx.findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(ctx.device(), &mai, nullptr, &outMem));
+    vkAllocateMemory(ctx.device(), &mai, nullptr, &outMem);
     vkBindImageMemory(ctx.device(), outImg, outMem, 0);
 
     auto cmd = ctx.beginSingleTimeCommands(pool);
@@ -146,25 +160,19 @@ static VkImageView makeSmallTexture(VulkanContext& ctx, VkCommandPool pool,
     ivci.subresourceRange.levelCount     = 1;
     ivci.subresourceRange.layerCount     = 1;
     VkImageView view = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateImageView(ctx.device(), &ivci, nullptr, &view));
+    vkCreateImageView(ctx.device(), &ivci, nullptr, &view);
     return view;
 }
 
-// ---------------------------------------------------------------------------
-// Fallback texture creation
-// ---------------------------------------------------------------------------
 void PBRModel::createFallbackTextures(VkCommandPool pool) {
-    // White: albedo/roughness/metallic/AO fallback
     m_fbWhiteView = makeSmallTexture(m_ctx, pool,
         255, 255, 255, 255, m_fbWhiteImg, m_fbWhiteMem);
-
-    // Flat normal: (0,0,1) encoded as (128,128,255)
     m_fbNormView = makeSmallTexture(m_ctx, pool,
         128, 128, 255, 255, m_fbNormImg, m_fbNormMem);
 }
 
 // ---------------------------------------------------------------------------
-// Texture loading from disk via stb_image
+// Texture loading from disk — generates full mip chain via vkCmdBlitImage
 // ---------------------------------------------------------------------------
 VkImageView PBRModel::loadTextureFile(const std::string& path, bool srgb,
                                       VkImage& outImg, VkDeviceMemory& outMem,
@@ -178,6 +186,7 @@ VkImageView PBRModel::loadTextureFile(const std::string& path, bool srgb,
 
     VkDeviceSize imageSize = static_cast<VkDeviceSize>(w) * h * 4;
     VkFormat fmt = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    uint32_t mipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(w, h)))) + 1;
 
     Buffer staging(m_ctx, imageSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -185,17 +194,18 @@ VkImageView PBRModel::loadTextureFile(const std::string& path, bool srgb,
     staging.writeHostVisible(pixels, imageSize);
     stbi_image_free(pixels);
 
-    // Create device-local image
+    // TRANSFER_SRC needed on each mip level so the blit can read from level i-1
     VkImageCreateInfo ici{};
     ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.imageType     = VK_IMAGE_TYPE_2D;
     ici.extent        = { static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1 };
-    ici.mipLevels     = 1;
+    ici.mipLevels     = mipLevels;
     ici.arrayLayers   = 1;
     ici.format        = fmt;
     ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                       | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.samples       = VK_SAMPLE_COUNT_1_BIT;
     ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     VK_CHECK(vkCreateImage(m_ctx.device(), &ici, nullptr, &outImg));
@@ -211,6 +221,8 @@ VkImageView PBRModel::loadTextureFile(const std::string& path, bool srgb,
     vkBindImageMemory(m_ctx.device(), outImg, outMem, 0);
 
     auto cmd = m_ctx.beginSingleTimeCommands(pool);
+
+    // Transition all levels UNDEFINED → TRANSFER_DST_OPTIMAL
     {
         VkImageMemoryBarrier b{};
         b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -219,16 +231,70 @@ VkImageView PBRModel::loadTextureFile(const std::string& path, bool srgb,
         b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image               = outImg;
-        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1 };
         b.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,0,nullptr,0,nullptr,1,&b);
     }
+
+    // Copy staging data into mip level 0
     VkBufferImageCopy region{};
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent      = { static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1 };
     vkCmdCopyBufferToImage(cmd, staging.handle(), outImg,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Generate mip chain: blit level i-1 → level i, then transition i-1 to SHADER_READ_ONLY
+    int32_t mipW = w, mipH = h;
+    for (uint32_t i = 1; i < mipLevels; ++i) {
+        // Level i-1: TRANSFER_DST → TRANSFER_SRC
+        VkImageMemoryBarrier toSrc{};
+        toSrc.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toSrc.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toSrc.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrc.image               = outImg;
+        toSrc.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1 };
+        toSrc.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toSrc.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0,0,nullptr,0,nullptr,1,&toSrc);
+
+        int32_t nextW = std::max(1, mipW / 2);
+        int32_t nextH = std::max(1, mipH / 2);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1 };
+        blit.srcOffsets[0]  = { 0, 0, 0 };
+        blit.srcOffsets[1]  = { mipW, mipH, 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1 };
+        blit.dstOffsets[0]  = { 0, 0, 0 };
+        blit.dstOffsets[1]  = { nextW, nextH, 1 };
+        vkCmdBlitImage(cmd,
+            outImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            outImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blit, VK_FILTER_LINEAR);
+
+        // Level i-1: TRANSFER_SRC → SHADER_READ_ONLY
+        VkImageMemoryBarrier toRead{};
+        toRead.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        toRead.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toRead.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toRead.image               = outImg;
+        toRead.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1 };
+        toRead.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+        toRead.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,0,nullptr,0,nullptr,1,&toRead);
+
+        mipW = nextW;
+        mipH = nextH;
+    }
+
+    // Transition last mip level: TRANSFER_DST → SHADER_READ_ONLY
     {
         VkImageMemoryBarrier b{};
         b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -237,6 +303,160 @@ VkImageView PBRModel::loadTextureFile(const std::string& path, bool srgb,
         b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image               = outImg;
+        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, mipLevels - 1, 1, 0, 1 };
+        b.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,0,nullptr,0,nullptr,1,&b);
+    }
+
+    m_ctx.endSingleTimeCommands(pool, cmd);
+
+    VkImageViewCreateInfo ivci{};
+    ivci.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    ivci.image                           = outImg;
+    ivci.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
+    ivci.format                          = fmt;
+    ivci.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    ivci.subresourceRange.levelCount     = mipLevels;
+    ivci.subresourceRange.layerCount     = 1;
+    VkImageView view = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateImageView(m_ctx.device(), &ivci, nullptr, &view));
+
+    std::cout << "[PBR] Loaded texture: " << fs::path(path).filename().string()
+              << " (" << w << "x" << h << ", " << mipLevels << " mips, "
+              << (srgb ? "sRGB" : "linear") << ")\n";
+    return view;
+}
+
+// ---------------------------------------------------------------------------
+// IBL: GGX BRDF integration LUT (Hammersley + Smith-GGX split-sum)
+// Stores (scale, bias) → R8G8 of RGBA8 image at (NdotV, roughness)
+// ---------------------------------------------------------------------------
+static float radicalInverse_VdC(uint32_t bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return static_cast<float>(bits) * 2.3283064365386963e-10f;
+}
+
+void PBRModel::generateBRDFLut(VkCommandPool pool) {
+    constexpr uint32_t SZ  = 256;
+    constexpr uint32_t NSP = 512;
+    constexpr float PI = 3.14159265358979f;
+
+    std::vector<uint8_t> lutData(SZ * SZ * 4);
+
+    for (uint32_t y = 0; y < SZ; ++y) {
+        float roughness = (y + 0.5f) / float(SZ);
+        float a  = roughness * roughness;
+        float a2 = a * a;
+
+        for (uint32_t x = 0; x < SZ; ++x) {
+            float NdotV = (x + 0.5f) / float(SZ);
+            // View vector in tangent space (N = Z axis)
+            float Vx = std::sqrt(1.0f - NdotV * NdotV);
+            float Vz = NdotV;
+
+            float A = 0.0f, B = 0.0f;
+            for (uint32_t i = 0; i < NSP; ++i) {
+                float u1 = float(i) / float(NSP);
+                float u2 = radicalInverse_VdC(i);
+
+                // GGX importance sample half-vector
+                float phi      = 2.0f * PI * u1;
+                float cosTheta = std::sqrt((1.0f - u2) / (1.0f + (a2 - 1.0f) * u2));
+                float sinTheta = std::sqrt(1.0f - cosTheta * cosTheta);
+                float Hx = std::cos(phi) * sinTheta;
+                float Hz = cosTheta;
+
+                // L = reflect(-V, H)
+                float VdotH = Vx * Hx + Vz * Hz;  // Vy=0
+                float Lz = 2.0f * VdotH * Hz - Vz;
+                float NdotL = std::max(Lz, 0.0f);
+                float NdotH = std::max(Hz, 0.0f);
+                float vdotH = std::max(VdotH, 0.0f);
+
+                if (NdotL > 0.0f) {
+                    // IBL roughness remapping: k = a/2 (vs direct: k=(r+1)^2/8)
+                    float k   = a / 2.0f;
+                    float G_V = NdotV / (NdotV * (1.0f - k) + k);
+                    float G_L = NdotL / (NdotL * (1.0f - k) + k);
+                    float G_vis = G_V * G_L * vdotH / (NdotH * NdotV + 1e-6f);
+                    float Fc    = std::pow(1.0f - vdotH, 5.0f);
+                    A += (1.0f - Fc) * G_vis;
+                    B += Fc          * G_vis;
+                }
+            }
+            A /= float(NSP);
+            B /= float(NSP);
+
+            uint32_t idx = (y * SZ + x) * 4;
+            lutData[idx+0] = static_cast<uint8_t>(std::min(std::max(A, 0.0f), 1.0f) * 255.0f);
+            lutData[idx+1] = static_cast<uint8_t>(std::min(std::max(B, 0.0f), 1.0f) * 255.0f);
+            lutData[idx+2] = 0;
+            lutData[idx+3] = 255;
+        }
+    }
+
+    VkDeviceSize sz = SZ * SZ * 4;
+    Buffer staging(m_ctx, sz,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    staging.writeHostVisible(lutData.data(), sz);
+
+    VkImageCreateInfo ici{};
+    ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType     = VK_IMAGE_TYPE_2D;
+    ici.extent        = { SZ, SZ, 1 };
+    ici.mipLevels     = 1;
+    ici.arrayLayers   = 1;
+    ici.format        = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ici.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+    ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateImage(m_ctx.device(), &ici, nullptr, &m_brdfLutImg));
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(m_ctx.device(), m_brdfLutImg, &req);
+    VkMemoryAllocateInfo mai{};
+    mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize  = req.size;
+    mai.memoryTypeIndex = m_ctx.findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(m_ctx.device(), &mai, nullptr, &m_brdfLutMem));
+    vkBindImageMemory(m_ctx.device(), m_brdfLutImg, m_brdfLutMem, 0);
+
+    auto cmd = m_ctx.beginSingleTimeCommands(pool);
+    {
+        VkImageMemoryBarrier b{};
+        b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image               = m_brdfLutImg;
+        b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0,0,nullptr,0,nullptr,1,&b);
+    }
+    VkBufferImageCopy region{};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent      = { SZ, SZ, 1 };
+    vkCmdCopyBufferToImage(cmd, staging.handle(), m_brdfLutImg,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    {
+        VkImageMemoryBarrier b{};
+        b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image               = m_brdfLutImg;
         b.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         b.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
@@ -246,60 +466,82 @@ VkImageView PBRModel::loadTextureFile(const std::string& path, bool srgb,
     m_ctx.endSingleTimeCommands(pool, cmd);
 
     VkImageViewCreateInfo ivci{};
-    ivci.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    ivci.image                           = outImg;
-    ivci.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
-    ivci.format                          = fmt;
-    ivci.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-    ivci.subresourceRange.levelCount     = 1;
-    ivci.subresourceRange.layerCount     = 1;
-    VkImageView view = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateImageView(m_ctx.device(), &ivci, nullptr, &view));
+    ivci.sType                       = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    ivci.image                       = m_brdfLutImg;
+    ivci.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
+    ivci.format                      = VK_FORMAT_R8G8B8A8_UNORM;
+    ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ivci.subresourceRange.levelCount = 1;
+    ivci.subresourceRange.layerCount = 1;
+    VK_CHECK(vkCreateImageView(m_ctx.device(), &ivci, nullptr, &m_brdfLutView));
+    std::cout << "[PBR] Generated BRDF LUT (" << SZ << "x" << SZ << ", "
+              << NSP << " samples)\n";
+}
 
-    std::cout << "[PBR] Loaded texture: " << fs::path(path).filename().string()
-              << " (" << w << "x" << h << ", " << (srgb ? "sRGB" : "linear") << ")\n";
-    return view;
+// ---------------------------------------------------------------------------
+// IBL: Load equirectangular env map from the model directory
+// Looks for any *env* or *Env* file (TGA, PNG, HDR) in the FBX directory.
+// ---------------------------------------------------------------------------
+void PBRModel::loadEnvMap(VkCommandPool pool) {
+    static const char* kExts[] = { ".tga", ".png", ".jpg", ".hdr", nullptr };
+
+    // First try canonical name used by XPS exports
+    for (const char** ext = kExts; *ext; ++ext) {
+        std::string candidate = m_dir + "/Gen_Env" + *ext;
+        if (fs::exists(candidate)) {
+            m_envView = loadTextureFile(candidate, false, m_envImg, m_envMem, pool);
+            if (m_envView) return;
+        }
+    }
+
+    // Broad search: any filename containing "env" (case-insensitive)
+    try {
+        for (auto& entry : fs::directory_iterator(m_dir)) {
+            if (!entry.is_regular_file()) continue;
+            std::string fn = entry.path().filename().string();
+            std::string fnLow = fn;
+            std::transform(fnLow.begin(), fnLow.end(), fnLow.begin(), ::tolower);
+            if (fnLow.find("env") == std::string::npos) continue;
+
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            bool validExt = (ext == ".tga" || ext == ".png" || ext == ".jpg" || ext == ".hdr");
+            if (!validExt) continue;
+
+            m_envView = loadTextureFile(entry.path().string(), false, m_envImg, m_envMem, pool);
+            if (m_envView) return;
+        }
+    } catch (...) {}
+
+    std::cout << "[PBR] No env map found in '" << m_dir << "' — IBL uses white fallback\n";
 }
 
 // ---------------------------------------------------------------------------
 // Texture path resolution
-// Assimp may give us: absolute path, relative path, or just a filename.
-// We try several locations relative to the FBX's directory.
 // ---------------------------------------------------------------------------
 std::string PBRModel::resolveTexPath(const std::string& raw) const {
     if (raw.empty()) return {};
-
-    // 1. Try as-is
     if (fs::exists(raw)) return raw;
 
-    // 2. Just the filename, next to the FBX
     std::string filename = fs::path(raw).filename().string();
     std::string candidate = m_dir + "/" + filename;
     if (fs::exists(candidate)) return candidate;
 
-    // 3. In a "textures" subdirectory
     candidate = m_dir + "/textures/" + filename;
     if (fs::exists(candidate)) return candidate;
 
-    // 4. In a "Texture" subdirectory (common in XPS exports)
     candidate = m_dir + "/Texture/" + filename;
     if (fs::exists(candidate)) return candidate;
 
     return {};
 }
 
-// ---------------------------------------------------------------------------
-// Suffix-based texture slot detection
-// Returns the PBR slot index [0..kPBRTexCount) or -1 if unrecognised.
-// ---------------------------------------------------------------------------
 static int detectSlotFromFilename(const std::string& filename) {
-    // Convert to upper-case for case-insensitive matching
     std::string upper = filename;
     std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
-    // Test from most specific to least specific
     if (upper.find("_AO")   != std::string::npos) return kPBRAO;
-    if (upper.find("_ATOC") != std::string::npos) return kPBRAlbedo; // ATOC treated as albedo alpha
+    if (upper.find("_ATOC") != std::string::npos) return kPBRAlbedo;
     if (upper.find("_D.")   != std::string::npos ||
         upper.rfind("_D")   == upper.size() - 2)  return kPBRAlbedo;
     if (upper.find("_N.")   != std::string::npos ||
@@ -309,7 +551,7 @@ static int detectSlotFromFilename(const std::string& filename) {
     if (upper.find("_M.")   != std::string::npos ||
         upper.rfind("_M")   == upper.size() - 2)  return kPBRMetallic;
     if (upper.find("_S.")   != std::string::npos ||
-        upper.rfind("_S")   == upper.size() - 2)  return kPBRRoughness; // _S specular → roughness
+        upper.rfind("_S")   == upper.size() - 2)  return kPBRRoughness;
     return -1;
 }
 
@@ -334,7 +576,7 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
 
     createFallbackTextures(pool);
 
-    // Create sampler (shared across all textures)
+    // Sampler: linear filtering + full mip range + repeat addressing
     VkSamplerCreateInfo sci{};
     sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     sci.magFilter    = VK_FILTER_LINEAR;
@@ -344,6 +586,7 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
     sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.borderColor  = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    sci.maxLod       = VK_LOD_CLAMP_NONE;  // exposes all generated mip levels
     VK_CHECK(vkCreateSampler(m_ctx.device(), &sci, nullptr, &m_sampler));
 
     // -----------------------------------------------------------------------
@@ -356,8 +599,6 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
         aiMat->Get(AI_MATKEY_NAME, name);
         m_materials[mi].name = name.C_Str();
 
-        // Gather every referenced texture regardless of Assimp semantic type,
-        // then classify by filename suffix.
         static const aiTextureType kAllTypes[] = {
             aiTextureType_DIFFUSE, aiTextureType_SPECULAR, aiTextureType_AMBIENT,
             aiTextureType_NORMALS, aiTextureType_HEIGHT,
@@ -366,7 +607,6 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
             aiTextureType_AMBIENT_OCCLUSION, aiTextureType_UNKNOWN
         };
 
-        // Track resolved paths that fill a slot — used below for base-name inference
         std::vector<std::string> slotPaths(kPBRTexCount);
 
         for (aiTextureType type : kAllTypes) {
@@ -374,21 +614,16 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
             for (unsigned ti = 0; ti < count; ++ti) {
                 aiString texPath;
                 if (aiMat->GetTexture(type, ti, &texPath) != AI_SUCCESS) continue;
-                if (texPath.length == 0) continue;
+                if (texPath.length == 0 || texPath.data[0] == '*') continue;
 
-                // Skip embedded texture references (begin with '*')
-                if (texPath.data[0] == '*') continue;
-
-                std::string rawPath = texPath.C_Str();
-                std::string resolved = resolveTexPath(rawPath);
+                std::string resolved = resolveTexPath(texPath.C_Str());
                 if (resolved.empty()) {
-                    std::cerr << "[PBR] Texture not found: " << rawPath << "\n";
+                    std::cerr << "[PBR] Texture not found: " << texPath.C_Str() << "\n";
                     continue;
                 }
 
                 int slot = detectSlotFromFilename(fs::path(resolved).filename().string());
                 if (slot < 0) {
-                    // Fallback: map Assimp type to slot
                     if      (type == aiTextureType_DIFFUSE)           slot = kPBRAlbedo;
                     else if (type == aiTextureType_NORMALS ||
                              type == aiTextureType_HEIGHT)             slot = kPBRNormal;
@@ -400,12 +635,9 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
                              type == aiTextureType_AMBIENT)            slot = kPBRAO;
                     else continue;
                 }
-
-                if (m_materials[mi].hasMap[slot]) continue; // first match wins
+                if (m_materials[mi].hasMap[slot]) continue;
 
                 bool srgb = (slot == kPBRAlbedo);
-
-                // Check cache: same file used by multiple materials shares one VkImage
                 VkImageView view = VK_NULL_HANDLE;
                 auto cacheIt = m_texCache.find(resolved);
                 if (cacheIt != m_texCache.end()) {
@@ -416,7 +648,6 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
                     if (view != VK_NULL_HANDLE)
                         m_texCache[resolved] = { img, mem, view };
                 }
-
                 if (view != VK_NULL_HANDLE) {
                     m_materials[mi].views[slot]  = view;
                     m_materials[mi].hasMap[slot] = true;
@@ -425,19 +656,13 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
             }
         }
 
-        // -----------------------------------------------------------------------
-        // Fill missing slots by inferring base name from already-loaded textures.
-        // The FBX may only reference a subset of available texture files (common in
-        // XPS exports). For each empty slot, strip the suffix from any loaded texture
-        // path to get a base (e.g. "Leon_Hair_N.png" → "Leon_Hair"), then probe for
-        // the expected file (e.g. "Leon_Hair_D.png") in the FBX directory.
-        // -----------------------------------------------------------------------
+        // Base-name inference: recover missing slots from stems of loaded textures
         static const char* kStripSuffixes[] = {
             "_N", "_AO", "_R", "_M", "_S", "_D", "_D-cut", "_ATOC", nullptr
         };
         struct SlotProbe {
             int         slot;
-            const char* suffixes[4];  // candidates in priority order, null-terminated
+            const char* suffixes[4];
             bool        srgb;
         };
         static const SlotProbe kProbes[] = {
@@ -448,19 +673,16 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
             { kPBRNormal,    {"_N.png",  "_N.tga",  nullptr,      nullptr     }, false },
         };
 
-        // Collect candidate base names from loaded texture stems
         std::vector<std::string> bases;
         for (int t = 0; t < kPBRTexCount; ++t) {
             if (slotPaths[t].empty()) continue;
-            std::string stem = fs::path(slotPaths[t]).stem().string();  // e.g. "Leon_Hair_N"
+            std::string stem = fs::path(slotPaths[t]).stem().string();
             for (const char** s = kStripSuffixes; *s; ++s) {
                 std::string suf(*s);
                 if (stem.size() > suf.size() &&
                     stem.substr(stem.size() - suf.size()) == suf) {
                     std::string base = stem.substr(0, stem.size() - suf.size());
-                    // Skip overly-generic bases (e.g. "Gen", "hair")
-                    if (base.size() >= 4)
-                        bases.push_back(base);
+                    if (base.size() >= 4) bases.push_back(base);
                     break;
                 }
             }
@@ -496,8 +718,11 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
     }
 
     // -----------------------------------------------------------------------
-    // Process mesh nodes (depth-first traversal)
+    // Process mesh nodes — accumulate into consolidated VBO/IBO for GPU-driven indirect
     // -----------------------------------------------------------------------
+    std::vector<PBRVertex> allVerts;
+    std::vector<uint32_t>  allIndices;
+
     std::function<void(const aiNode*)> processNode = [&](const aiNode* node) {
         for (unsigned mi = 0; mi < node->mNumMeshes; ++mi) {
             const aiMesh* mesh = scene->mMeshes[node->mMeshes[mi]];
@@ -508,7 +733,6 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
 
             for (unsigned vi = 0; vi < mesh->mNumVertices; ++vi) {
                 PBRVertex v{};
-
                 v.pos[0] = mesh->mVertices[vi].x;
                 v.pos[1] = mesh->mVertices[vi].y;
                 v.pos[2] = mesh->mVertices[vi].z;
@@ -518,12 +742,10 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
                     v.normal[1] = mesh->mNormals[vi].y;
                     v.normal[2] = mesh->mNormals[vi].z;
                 }
-
                 if (mesh->mTextureCoords[0]) {
                     v.uv[0] = mesh->mTextureCoords[0][vi].x;
                     v.uv[1] = mesh->mTextureCoords[0][vi].y;
                 }
-
                 if (mesh->HasTangentsAndBitangents()) {
                     v.tangent[0]   = mesh->mTangents[vi].x;
                     v.tangent[1]   = mesh->mTangents[vi].y;
@@ -532,11 +754,9 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
                     v.bitangent[1] = mesh->mBitangents[vi].y;
                     v.bitangent[2] = mesh->mBitangents[vi].z;
                 } else {
-                    // Fallback tangent frame: T=(1,0,0), B=(0,1,0)
                     v.tangent[0] = 1.0f;
                     v.bitangent[1] = 1.0f;
                 }
-
                 verts.push_back(v);
             }
 
@@ -549,22 +769,14 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
             if (verts.empty() || indices.empty()) continue;
 
             PBRSubmesh submesh;
-            submesh.name        = mesh->mName.C_Str();
-            submesh.materialIdx = static_cast<int>(mesh->mMaterialIndex);
-            submesh.indexCount  = static_cast<uint32_t>(indices.size());
+            submesh.name         = mesh->mName.C_Str();
+            submesh.materialIdx  = static_cast<int>(mesh->mMaterialIndex);
+            submesh.indexCount   = static_cast<uint32_t>(indices.size());
+            submesh.firstIndex   = static_cast<uint32_t>(allIndices.size());
+            submesh.vertexOffset = static_cast<int32_t>(allVerts.size());
 
-            VkDeviceSize vsize = verts.size()   * sizeof(PBRVertex);
-            VkDeviceSize isize = indices.size()  * sizeof(uint32_t);
-
-            submesh.vertexBuffer = std::make_unique<Buffer>(m_ctx, vsize,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            submesh.vertexBuffer->upload(pool, verts.data(), vsize);
-
-            submesh.indexBuffer = std::make_unique<Buffer>(m_ctx, isize,
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            submesh.indexBuffer->upload(pool, indices.data(), isize);
+            allVerts.insert(allVerts.end(), verts.begin(), verts.end());
+            allIndices.insert(allIndices.end(), indices.begin(), indices.end());
 
             std::cout << "[PBR] Submesh '" << submesh.name << "': "
                       << verts.size() << " verts, "
@@ -578,10 +790,53 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
 
     processNode(scene->mRootNode);
 
+    if (m_submeshes.empty()) {
+        std::cerr << "[PBR] No submeshes loaded from '" << fbxPath << "'\n";
+        return false;
+    }
+
+    // Upload consolidated geometry buffers
+    {
+        VkDeviceSize vsize = allVerts.size()   * sizeof(PBRVertex);
+        VkDeviceSize isize = allIndices.size() * sizeof(uint32_t);
+
+        m_consolidatedVBO = std::make_unique<Buffer>(m_ctx, vsize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        m_consolidatedVBO->upload(pool, allVerts.data(), vsize);
+
+        m_consolidatedIBO = std::make_unique<Buffer>(m_ctx, isize,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        m_consolidatedIBO->upload(pool, allIndices.data(), isize);
+    }
+
+    // Build and upload GPU-driven indirect command buffer
+    {
+        std::vector<VkDrawIndexedIndirectCommand> indirects(m_submeshes.size());
+        for (size_t s = 0; s < m_submeshes.size(); ++s) {
+            indirects[s].indexCount    = m_submeshes[s].indexCount;
+            indirects[s].instanceCount = 1;
+            indirects[s].firstIndex    = m_submeshes[s].firstIndex;
+            indirects[s].vertexOffset  = m_submeshes[s].vertexOffset;
+            indirects[s].firstInstance = 0;
+        }
+        VkDeviceSize indSize = m_submeshes.size() * sizeof(VkDrawIndexedIndirectCommand);
+        m_indirectBuffer = std::make_unique<Buffer>(m_ctx, indSize,
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        m_indirectBuffer->upload(pool, indirects.data(), indSize);
+    }
+
+    // IBL resources (generated after sampler is ready)
+    generateBRDFLut(pool);
+    loadEnvMap(pool);
+
     std::cout << "[PBR] Loaded '" << fs::path(fbxPath).filename().string() << "': "
               << m_submeshes.size() << " submeshes, "
+              << allVerts.size() << " total verts, "
               << m_materials.size() << " materials\n";
-    return !m_submeshes.empty();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -591,7 +846,6 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
     m_framesInFlight = framesInFlight;
     uint32_t nSets   = static_cast<uint32_t>(m_submeshes.size() * framesInFlight);
 
-    // --- Per-frame UBO buffers ---
     for (int f = 0; f < framesInFlight; ++f) {
         m_uboBuffers.push_back(std::make_unique<Buffer>(m_ctx,
             sizeof(PBRUBOData),
@@ -599,12 +853,11 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
     }
 
-    // --- Descriptor pool ---
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = nSets;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = nSets * kPBRTexCount;
+    poolSizes[1].descriptorCount = nSets * kTotalTexBindings;  // 5 material + 2 IBL
 
     VkDescriptorPoolCreateInfo pci{};
     pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -613,7 +866,6 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
     pci.maxSets       = nSets;
     VK_CHECK(vkCreateDescriptorPool(m_ctx.device(), &pci, nullptr, &m_descPool));
 
-    // --- Allocate sets ---
     std::vector<VkDescriptorSetLayout> layouts(nSets, pbrDSLayout);
     VkDescriptorSetAllocateInfo ai{};
     ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -623,37 +875,40 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
     m_descSets.resize(nSets);
     VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_descSets.data()));
 
-    // --- Write descriptors ---
+    // IBL views (fallback to white if not loaded)
+    VkImageView envView  = m_envView     ? m_envView     : m_fbWhiteView;
+    VkImageView brdfView = m_brdfLutView ? m_brdfLutView : m_fbWhiteView;
+
     for (int s = 0; s < static_cast<int>(m_submeshes.size()); ++s) {
         int matIdx = m_submeshes[s].materialIdx;
 
         for (int f = 0; f < framesInFlight; ++f) {
             VkDescriptorSet ds = m_descSets[s * framesInFlight + f];
 
-            // Binding 0: UBO for this frame
             VkDescriptorBufferInfo bi{};
             bi.buffer = m_uboBuffers[f]->handle();
             bi.offset = 0;
             bi.range  = sizeof(PBRUBOData);
 
-            // Bindings 1-5: texture maps (use fallbacks if absent)
-            VkDescriptorImageInfo imgInfos[kPBRTexCount]{};
+            // Bindings 1-5: per-material textures
+            VkDescriptorImageInfo imgInfos[kTotalTexBindings]{};
             for (int t = 0; t < kPBRTexCount; ++t) {
                 imgInfos[t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 imgInfos[t].sampler     = m_sampler;
-
                 VkImageView view = VK_NULL_HANDLE;
                 if (matIdx >= 0 && matIdx < static_cast<int>(m_materials.size())
                     && m_materials[matIdx].hasMap[t]) {
                     view = m_materials[matIdx].views[t];
                 }
-                if (view == VK_NULL_HANDLE) {
-                    view = (t == kPBRNormal) ? m_fbNormView : m_fbWhiteView;
-                }
-                imgInfos[t].imageView = view;
+                imgInfos[t].imageView = (view != VK_NULL_HANDLE)
+                    ? view
+                    : (t == kPBRNormal ? m_fbNormView : m_fbWhiteView);
             }
+            // Bindings 6-7: IBL (env map + BRDF LUT)
+            imgInfos[kPBRTexCount + 0] = { m_sampler, envView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            imgInfos[kPBRTexCount + 1] = { m_sampler, brdfView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
 
-            std::array<VkWriteDescriptorSet, 1 + kPBRTexCount> writes{};
+            std::array<VkWriteDescriptorSet, 1 + kTotalTexBindings> writes{};
             writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet          = ds;
             writes[0].dstBinding      = 0;
@@ -661,7 +916,7 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
             writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             writes[0].pBufferInfo     = &bi;
 
-            for (int t = 0; t < kPBRTexCount; ++t) {
+            for (int t = 0; t < kTotalTexBindings; ++t) {
                 writes[1 + t].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[1 + t].dstSet          = ds;
                 writes[1 + t].dstBinding      = static_cast<uint32_t>(1 + t);
@@ -691,11 +946,12 @@ void PBRModel::updateUBO(int frameIdx, const float* view16, const float* proj16,
     m_uboBuffers[frameIdx]->writeHostVisible(&data, sizeof(data));
 }
 
-// ---------------------------------------------------------------------------
-// Descriptor set accessor
-// ---------------------------------------------------------------------------
 VkDescriptorSet PBRModel::descriptorSet(int submeshIdx, int frameIdx) const {
     return m_descSets[submeshIdx * m_framesInFlight + frameIdx];
 }
+
+VkBuffer PBRModel::consolidatedVBO() const { return m_consolidatedVBO->handle(); }
+VkBuffer PBRModel::consolidatedIBO() const { return m_consolidatedIBO->handle(); }
+VkBuffer PBRModel::indirectBuffer()  const { return m_indirectBuffer->handle();  }
 
 } // namespace tgt

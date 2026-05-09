@@ -24,8 +24,16 @@ enum class ValidationSeverity { Info, Warning, Error };
 struct ValidationMessage {
     ValidationSeverity severity;
     std::string        text;
-    std::string        suggestion;  // actionable hint derived from VUID/message text
+    std::string        suggestion;
     uint32_t           frame = 0;
+};
+
+// Per-heap VRAM budget and usage (from VK_EXT_memory_budget)
+struct MemoryBudget {
+    uint32_t     heapCount = 0;
+    VkDeviceSize budget[VK_MAX_MEMORY_HEAPS] = {};  // available budget per heap
+    VkDeviceSize usage[VK_MAX_MEMORY_HEAPS]  = {};  // current usage per heap
+    bool         supported = false;
 };
 
 class VulkanContext {
@@ -54,15 +62,26 @@ public:
     VkCommandBuffer beginSingleTimeCommands(VkCommandPool pool) const;
     void            endSingleTimeCommands(VkCommandPool pool, VkCommandBuffer cmd) const;
 
-    // Validation log — populated when validation layers are active
+    // Validation log
     void setCurrentFrame(uint32_t frame) { m_currentFrame = frame; }
     const std::vector<ValidationMessage>& validationLog() const { return m_validationLog; }
+
+    // VK_EXT_memory_budget: per-heap VRAM budget and usage
+    MemoryBudget queryMemoryBudget() const;
+
+    // Nsight/RenderDoc debug labels (VK_EXT_debug_utils)
+    void beginDebugLabel(VkCommandBuffer cmd, const char* name,
+                         float r = 0.5f, float g = 0.5f, float b = 1.0f) const;
+    void endDebugLabel(VkCommandBuffer cmd) const;
+    void insertDebugLabel(VkCommandBuffer cmd, const char* name,
+                          float r = 1.0f, float g = 1.0f, float b = 0.0f) const;
 
 private:
     void createInstance();
     void setupDebugMessenger();
     void pickPhysicalDevice();
     void createLogicalDevice();
+    void loadDebugLabelFunctions();
 
     bool checkValidationLayerSupport() const;
     bool isDeviceSuitable(VkPhysicalDevice dev, VkSurfaceKHR surface) const;
@@ -86,9 +105,15 @@ private:
     float                    m_timestampPeriod = 1.0f;
     bool                     m_validation;
     bool                     m_headless;
+    bool                     m_memBudgetSupported = false;
 
-    uint32_t                      m_currentFrame = 0;
-    mutable std::mutex            m_logMutex;
+    // Nsight/RenderDoc: vkCmdBegin/EndDebugUtilsLabelEXT function pointers
+    PFN_vkCmdBeginDebugUtilsLabelEXT  m_fnBeginLabel  = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT    m_fnEndLabel    = nullptr;
+    PFN_vkCmdInsertDebugUtilsLabelEXT m_fnInsertLabel = nullptr;
+
+    uint32_t                       m_currentFrame = 0;
+    mutable std::mutex             m_logMutex;
     std::vector<ValidationMessage> m_validationLog;
 
     static const std::vector<const char*> kValidationLayers;
