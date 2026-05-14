@@ -43,9 +43,18 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ steps.vk.outputs.version }}"
-          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
-          Write-Host "Downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile VulkanSDK.exe -UseBasicParsing
+          $base = "https://sdk.lunarg.com/sdk/download/$ver/windows"
+          # SDK 1.4.x uses vulkan_sdk.exe; 1.3.x used VulkanSDK-{ver}-Installer.exe
+          $candidates = @("$base/vulkan_sdk.exe", "$base/VulkanSDK-$ver-Installer.exe")
+          $ok = $false
+          foreach ($url in $candidates) {
+            Write-Host "Trying $url"
+            try {
+              Invoke-WebRequest -Uri $url -OutFile VulkanSDK.exe -UseBasicParsing -ErrorAction Stop
+              $ok = $true; break
+            } catch { Write-Host "Not found, trying next..." }
+          }
+          if (-not $ok) { Write-Error "No installer found for Vulkan SDK $ver"; exit 1 }
           Write-Host "Installing..."
           Start-Process VulkanSDK.exe `
             -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" `
