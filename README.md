@@ -17,17 +17,23 @@ and validate its own output.
 
 ### PBR model scene — Leon S. Kennedy (RE4R XPS, 49 submeshes, 194,242 verts, 4K textures)
 
+All subsystems active simultaneously: mesh shaders, RT shadows (49 BLASes + TLAS), async compute
+frustum culling, bindless descriptor heap, pipeline cache warm.
+
 | Metric | Value |
 |---|---|
-| Headless FPS (300 frames) | **~979 avg** |
-| CPU frame time p50 | **0.27 ms** |
+| Headless FPS (300 frames, warm cache) | **~1505 avg** |
+| CPU frame time avg | **0.66 ms** |
+| CPU frame time p50 | **0.29 ms** |
+| CPU frame time p95 | **2.36 ms** |
+| GPU frame time avg | **0.50 ms** |
 | GPU frame time p50 | **0.22 ms** |
-| GPU frame time p95 | **6.48 ms** |
-| GPU frame time p99 | **12.24 ms** (pipeline warmup tail; eliminated by pipeline cache on warm runs) |
-| Hottest submesh (pants) | **~0.21 ms avg** |
-| Hottest submesh (jacket) | **~0.19 ms avg** |
-| Barrier probe overhead | **< 0.01 ms** |
-| Unique texture uploads | **58** (cache dedup from ~160 references) |
+| GPU frame time p95 | **2.27 ms** |
+| GPU frame time p99 | **4.52 ms** |
+| VS invocations / frame | **~28** (mesh shaders handle all 49 PBR submeshes; VS only serves ImGui overlay) |
+| FS invocations / frame | **~2,652** (795,609 / 300 frames) |
+| Clip invocations / frame | **~833** |
+| Bindless texture slots | **61** (deduplicated from ~160 material references, 49 submeshes) |
 | Spike frames | **0** |
 | GPU timestamp resolution | **1 ns/tick** |
 
@@ -210,11 +216,16 @@ regardless of submesh count.
 
 Inline ray tracing in the PBR fragment shader using `GL_EXT_ray_query` (no ray pipeline, no SBT):
 
-- **BLAS** — built from the consolidated triangle geometry buffer at load time using
-  `vkCmdBuildAccelerationStructuresKHR` with `GEOMETRY_TYPE_TRIANGLES`. Device-local scratch
-  buffer allocated, used, then freed after the build fence signals.
-- **TLAS** — one instance pointing at the BLAS with a configurable model transform. Written
-  into a `VkAccelerationStructureInstanceKHR` in a host-visible buffer; built on the graphics queue.
+- **BLASes** — one bottom-level acceleration structure per submesh (49 total for Leon), built
+  with `vkCmdBuildAccelerationStructuresKHR` (`GEOMETRY_TYPE_TRIANGLES`). Using per-submesh BLASes
+  rather than a single monolithic structure keeps each individual build under ~31K triangles so the
+  `vkQueueWaitIdle` call after each `endSingleTimeCommands` completes in milliseconds instead of
+  seconds (which previously blocked the Windows message pump and caused "Not Responding"). Each BLAS
+  uses a dedicated device-local scratch buffer freed after the build fence signals.
+- **TLAS** — 49 instances (one per BLAS), each with `instanceCustomIndex` equal to the submesh
+  index. Written into a `VkAccelerationStructureInstanceKHR` array in a host-visible buffer; built
+  on the graphics queue. `instanceCustomIndex` is available to the fragment shader for per-submesh
+  material disambiguation in future passes.
 - **Shadow ray** — for each lit fragment where `NdotL > 0`, a shadow ray is fired toward the
   directional light: `rayQueryInitializeEXT` with `gl_RayFlagsTerminateOnFirstHitEXT |
   gl_RayFlagsOpaqueEXT`. If `rayQueryGetIntersectionTypeEXT` returns a committed hit, the
@@ -327,6 +338,7 @@ build\Release\tegratrace.exe [options]
 | `--save-ref` | Save frames 100 and 400 as regression references |
 | `--multi-res` | Also test at 50% and 25% scale |
 | `--replay path` | Replay a captured frame JSON |
+| `--no-rt` | Skip BLAS/TLAS build (useful for benchmarking without RT overhead) |
 
 ---
 
