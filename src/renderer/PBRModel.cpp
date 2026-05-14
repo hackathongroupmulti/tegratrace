@@ -55,11 +55,14 @@ PBRModel::~PBRModel() {
     // RT acceleration structures (destroy AS handles before their backing buffers)
     if (m_ctx.rayQuerySupported()) {
         if (m_tlasHandle) m_ctx.fnDestroyAccelStruct(m_ctx.device(), m_tlasHandle, nullptr);
-        if (m_blasHandle) m_ctx.fnDestroyAccelStruct(m_ctx.device(), m_blasHandle, nullptr);
+        for (auto h : m_blasHandles)
+            if (h) m_ctx.fnDestroyAccelStruct(m_ctx.device(), h, nullptr);
     }
+    m_blasHandles.clear();
+    m_blasDevAddrs.clear();
     m_tlasBuffer.reset();
     m_tlasInstanceBuf.reset();
-    m_blasBuffer.reset();
+    m_blasBuffers.clear();
 
     // Fallback textures
     if (m_fbWhiteView) vkDestroyImageView(m_ctx.device(), m_fbWhiteView, nullptr);
@@ -1558,114 +1561,161 @@ VkBuffer PBRModel::indirectBuffer()  const { return m_indirectBuffer->handle(); 
 VkBuffer PBRModel::sphereBuffer()    const { return m_sphereBuffer->handle();    }
 
 // ---------------------------------------------------------------------------
-// VK_KHR_ray_query: build BLAS (all submeshes merged) then TLAS (one instance)
+// VK_KHR_ray_query: one BLAS per submesh (avoids TDR on large models) + TLAS
 // ---------------------------------------------------------------------------
 void PBRModel::buildAccelerationStructures(VkCommandPool pool, const float* modelMat16) {
-    if (!m_ctx.rayQuerySupported() || !m_consolidatedVBO || !m_consolidatedIBO) return;
-
-    const uint32_t totalVertices   = static_cast<uint32_t>(m_consolidatedVBO->size() / sizeof(PBRVertex));
-    const uint32_t totalPrimitives = static_cast<uint32_t>(m_consolidatedIBO->size()  / sizeof(uint32_t) / 3);
-
-    // ---- BLAS ----
-    VkAccelerationStructureGeometryTrianglesDataKHR triData{};
-    triData.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-    triData.vertexFormat  = VK_FORMAT_R32G32B32_SFLOAT;
-    triData.vertexData.deviceAddress = m_consolidatedVBO->deviceAddress();
-    triData.vertexStride  = sizeof(PBRVertex);
-    triData.maxVertex     = totalVertices - 1;
-    triData.indexType     = VK_INDEX_TYPE_UINT32;
-    triData.indexData.deviceAddress  = m_consolidatedIBO->deviceAddress();
-
-    VkAccelerationStructureGeometryKHR blasGeom{};
-    blasGeom.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-    blasGeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    blasGeom.flags        = VK_GEOMETRY_OPAQUE_BIT_KHR;
-    blasGeom.geometry.triangles = triData;
-
-    VkAccelerationStructureBuildGeometryInfoKHR blasBuildInfo{};
-    blasBuildInfo.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-    blasBuildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    blasBuildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-    blasBuildInfo.geometryCount = 1;
-    blasBuildInfo.pGeometries   = &blasGeom;
-
-    VkAccelerationStructureBuildSizesInfoKHR blasSizes{};
-    blasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-    m_ctx.fnGetAccelBuildSizes(m_ctx.device(),
-        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-        &blasBuildInfo, &totalPrimitives, &blasSizes);
-
-    m_blasBuffer = std::make_unique<Buffer>(m_ctx, blasSizes.accelerationStructureSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    VkAccelerationStructureCreateInfoKHR blasCI{};
-    blasCI.sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-    blasCI.buffer = m_blasBuffer->handle();
-    blasCI.size   = blasSizes.accelerationStructureSize;
-    blasCI.type   = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    VK_CHECK(m_ctx.fnCreateAccelStruct(m_ctx.device(), &blasCI, nullptr, &m_blasHandle));
-
-    auto blasScratch = std::make_unique<Buffer>(m_ctx, blasSizes.buildScratchSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    blasBuildInfo.mode                    = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    blasBuildInfo.dstAccelerationStructure = m_blasHandle;
-    blasBuildInfo.scratchData.deviceAddress = blasScratch->deviceAddress();
-
-    VkAccelerationStructureBuildRangeInfoKHR blasRange{ totalPrimitives, 0, 0, 0 };
-    const VkAccelerationStructureBuildRangeInfoKHR* pBlasRange = &blasRange;
-
-    {
-        auto cmd = m_ctx.beginSingleTimeCommands(pool);
-        m_ctx.fnCmdBuildAccelStructs(cmd, 1, &blasBuildInfo, &pBlasRange);
-        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR };
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-            0, 1, &mb, 0, nullptr, 0, nullptr);
-        m_ctx.endSingleTimeCommands(pool, cmd);
+    if (!m_ctx.rayQuerySupported() || !m_consolidatedVBO || !m_consolidatedIBO) {
+        std::cout << "[RT] buildAccelerationStructures: prerequisites not met"
+                  << " (rayQuery=" << m_ctx.rayQuerySupported()
+                  << " vbo=" << (m_consolidatedVBO != nullptr)
+                  << " ibo=" << (m_consolidatedIBO != nullptr) << ")\n" << std::flush;
+        return;
     }
-    blasScratch.reset();
 
-    // Get BLAS device address for the TLAS instance
-    VkAccelerationStructureDeviceAddressInfoKHR blasAddrInfo{};
-    blasAddrInfo.sType                 = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-    blasAddrInfo.accelerationStructure = m_blasHandle;
-    m_blasDevAddr = m_ctx.fnGetAccelDevAddr(m_ctx.device(), &blasAddrInfo);
+    const uint32_t subCount    = static_cast<uint32_t>(m_submeshes.size());
+    const uint32_t totalVerts  = static_cast<uint32_t>(m_consolidatedVBO->size() / sizeof(PBRVertex));
+    std::cout << "[RT] Building " << subCount << " BLASes ("
+              << totalVerts << " total verts)...\n" << std::flush;
 
-    // ---- TLAS ----
-    // Build instance with the caller-supplied model transform (column-major → row-major 3×4)
-    VkAccelerationStructureInstanceKHR inst{};
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 4; ++c)
-            inst.transform.matrix[r][c] = modelMat16[c * 4 + r];
-    inst.instanceCustomIndex                    = 0;
-    inst.mask                                   = 0xFF;
-    inst.instanceShaderBindingTableRecordOffset = 0;
-    inst.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    inst.accelerationStructureReference         = m_blasDevAddr;
+    m_blasHandles.assign(subCount, VK_NULL_HANDLE);
+    m_blasBuffers.resize(subCount);
+    m_blasDevAddrs.assign(subCount, 0);
 
-    m_tlasInstanceBuf = std::make_unique<Buffer>(m_ctx, sizeof(VkAccelerationStructureInstanceKHR),
+    uint32_t builtCount = 0;
+    for (uint32_t s = 0; s < subCount; ++s) {
+        const auto& sub = m_submeshes[s];
+        const uint32_t primCount = sub.indexCount / 3;
+        if (primCount == 0) {
+            std::cout << "[RT]   [" << s << "/" << subCount << "] '"
+                      << sub.name << "' skipped (0 tris)\n" << std::flush;
+            continue;
+        }
+
+        std::cout << "[RT]   [" << s << "/" << subCount << "] '"
+                  << sub.name << "' " << primCount << " tris..." << std::flush;
+
+        // Geometry points into the shared VBO/IBO; primitiveOffset + firstVertex select the submesh
+        VkAccelerationStructureGeometryTrianglesDataKHR triData{};
+        triData.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        triData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        triData.vertexData.deviceAddress = m_consolidatedVBO->deviceAddress();
+        triData.vertexStride = sizeof(PBRVertex);
+        triData.maxVertex    = totalVerts - 1;
+        triData.indexType    = VK_INDEX_TYPE_UINT32;
+        triData.indexData.deviceAddress  = m_consolidatedIBO->deviceAddress();
+
+        VkAccelerationStructureGeometryKHR blasGeom{};
+        blasGeom.sType                   = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        blasGeom.geometryType            = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        blasGeom.flags                   = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        blasGeom.geometry.triangles      = triData;
+
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+        buildInfo.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        buildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        buildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        buildInfo.geometryCount = 1;
+        buildInfo.pGeometries   = &blasGeom;
+
+        VkAccelerationStructureBuildSizesInfoKHR sizes{};
+        sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        m_ctx.fnGetAccelBuildSizes(m_ctx.device(),
+            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+            &buildInfo, &primCount, &sizes);
+
+        std::cout << " AS=" << sizes.accelerationStructureSize/1024
+                  << "KB scratch=" << sizes.buildScratchSize/1024 << "KB..." << std::flush;
+
+        m_blasBuffers[s] = std::make_unique<Buffer>(m_ctx, sizes.accelerationStructureSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        VkAccelerationStructureCreateInfoKHR asCI{};
+        asCI.sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+        asCI.buffer = m_blasBuffers[s]->handle();
+        asCI.size   = sizes.accelerationStructureSize;
+        asCI.type   = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        VK_CHECK(m_ctx.fnCreateAccelStruct(m_ctx.device(), &asCI, nullptr, &m_blasHandles[s]));
+
+        auto scratch = std::make_unique<Buffer>(m_ctx, sizes.buildScratchSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        buildInfo.mode                     = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        buildInfo.dstAccelerationStructure = m_blasHandles[s];
+        buildInfo.scratchData.deviceAddress = scratch->deviceAddress();
+
+        // primitiveOffset = byte offset into IBO; firstVertex = base vertex index
+        VkAccelerationStructureBuildRangeInfoKHR range{};
+        range.primitiveCount  = primCount;
+        range.primitiveOffset = sub.firstIndex * sizeof(uint32_t);
+        range.firstVertex     = static_cast<uint32_t>(sub.vertexOffset);
+        range.transformOffset = 0;
+        const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
+
+        {
+            auto cmd = m_ctx.beginSingleTimeCommands(pool);
+            m_ctx.fnCmdBuildAccelStructs(cmd, 1, &buildInfo, &pRange);
+            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR };
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                0, 1, &mb, 0, nullptr, 0, nullptr);
+            m_ctx.endSingleTimeCommands(pool, cmd);
+        }
+
+        VkAccelerationStructureDeviceAddressInfoKHR addrInfo{};
+        addrInfo.sType                 = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+        addrInfo.accelerationStructure = m_blasHandles[s];
+        m_blasDevAddrs[s] = m_ctx.fnGetAccelDevAddr(m_ctx.device(), &addrInfo);
+
+        std::cout << " OK (addr=0x" << std::hex << m_blasDevAddrs[s] << std::dec << ")\n" << std::flush;
+        ++builtCount;
+    }
+
+    std::cout << "[RT] " << builtCount << "/" << subCount
+              << " BLASes built. Building TLAS...\n" << std::flush;
+
+    // ---- TLAS: one instance per BLAS ----
+    std::vector<VkAccelerationStructureInstanceKHR> instances;
+    instances.reserve(builtCount);
+    for (uint32_t s = 0; s < subCount; ++s) {
+        if (m_blasDevAddrs[s] == 0) continue;
+        VkAccelerationStructureInstanceKHR inst{};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c)
+                inst.transform.matrix[r][c] = modelMat16[c * 4 + r];
+        inst.instanceCustomIndex                    = s;   // submesh index for shader lookup
+        inst.mask                                   = 0xFF;
+        inst.instanceShaderBindingTableRecordOffset = 0;
+        inst.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        inst.accelerationStructureReference         = m_blasDevAddrs[s];
+        instances.push_back(inst);
+    }
+
+    uint32_t instanceCount = static_cast<uint32_t>(instances.size());
+    std::cout << "[RT] TLAS instance count: " << instanceCount << "\n" << std::flush;
+
+    m_tlasInstanceBuf = std::make_unique<Buffer>(m_ctx,
+        instanceCount * sizeof(VkAccelerationStructureInstanceKHR),
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    m_tlasInstanceBuf->writeHostVisible(&inst, sizeof(inst));
+    m_tlasInstanceBuf->writeHostVisible(instances.data(),
+        instanceCount * sizeof(VkAccelerationStructureInstanceKHR));
 
-    VkAccelerationStructureGeometryInstancesDataKHR instancesData{};
-    instancesData.sType           = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-    instancesData.arrayOfPointers = VK_FALSE;
-    instancesData.data.deviceAddress = m_tlasInstanceBuf->deviceAddress();
+    VkAccelerationStructureGeometryInstancesDataKHR instData{};
+    instData.sType           = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    instData.arrayOfPointers = VK_FALSE;
+    instData.data.deviceAddress = m_tlasInstanceBuf->deviceAddress();
 
     VkAccelerationStructureGeometryKHR tlasGeom{};
-    tlasGeom.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-    tlasGeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-    tlasGeom.geometry.instances = instancesData;
+    tlasGeom.sType                    = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    tlasGeom.geometryType             = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeom.geometry.instances       = instData;
 
-    uint32_t instanceCount = 1;
     VkAccelerationStructureBuildGeometryInfoKHR tlasBuildInfo{};
     tlasBuildInfo.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     tlasBuildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
@@ -1679,6 +1729,9 @@ void PBRModel::buildAccelerationStructures(VkCommandPool pool, const float* mode
         VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
         &tlasBuildInfo, &instanceCount, &tlasSizes);
 
+    std::cout << "[RT] TLAS: AS=" << tlasSizes.accelerationStructureSize/1024
+              << "KB scratch=" << tlasSizes.buildScratchSize/1024 << "KB\n" << std::flush;
+
     m_tlasBuffer = std::make_unique<Buffer>(m_ctx, tlasSizes.accelerationStructureSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1689,6 +1742,7 @@ void PBRModel::buildAccelerationStructures(VkCommandPool pool, const float* mode
     tlasCI.size   = tlasSizes.accelerationStructureSize;
     tlasCI.type   = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
     VK_CHECK(m_ctx.fnCreateAccelStruct(m_ctx.device(), &tlasCI, nullptr, &m_tlasHandle));
+    std::cout << "[RT] TLAS handle created, building...\n" << std::flush;
 
     auto tlasScratch = std::make_unique<Buffer>(m_ctx, tlasSizes.buildScratchSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -1698,7 +1752,7 @@ void PBRModel::buildAccelerationStructures(VkCommandPool pool, const float* mode
     tlasBuildInfo.dstAccelerationStructure = m_tlasHandle;
     tlasBuildInfo.scratchData.deviceAddress = tlasScratch->deviceAddress();
 
-    VkAccelerationStructureBuildRangeInfoKHR tlasRange{ 1, 0, 0, 0 };
+    VkAccelerationStructureBuildRangeInfoKHR tlasRange{ instanceCount, 0, 0, 0 };
     const VkAccelerationStructureBuildRangeInfoKHR* pTlasRange = &tlasRange;
 
     {
@@ -1709,7 +1763,8 @@ void PBRModel::buildAccelerationStructures(VkCommandPool pool, const float* mode
     tlasScratch.reset();
 
     m_rtBuilt = true;
-    std::cout << "[PBRModel] BLAS/TLAS built (" << totalPrimitives << " triangles)\n";
+    std::cout << "[RT] Done: " << builtCount << " BLASes + TLAS ("
+              << instanceCount << " instances). Ray-traced shadows active.\n" << std::flush;
 }
 
 void PBRModel::writeTLASDescriptors() {

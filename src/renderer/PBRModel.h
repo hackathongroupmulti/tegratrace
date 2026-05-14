@@ -221,10 +221,10 @@ private:
     VkDescriptorPool             m_meshDescPool = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> m_meshDescSets;
 
-    // Ray tracing acceleration structures
-    VkAccelerationStructureKHR m_blasHandle = VK_NULL_HANDLE;
-    std::unique_ptr<Buffer>    m_blasBuffer;
-    VkDeviceAddress            m_blasDevAddr = 0;
+    // Ray tracing acceleration structures (one BLAS per submesh)
+    std::vector<VkAccelerationStructureKHR> m_blasHandles;
+    std::vector<std::unique_ptr<Buffer>>    m_blasBuffers;
+    std::vector<VkDeviceAddress>            m_blasDevAddrs;
     VkAccelerationStructureKHR m_tlasHandle = VK_NULL_HANDLE;
     std::unique_ptr<Buffer>    m_tlasBuffer;
     std::unique_ptr<Buffer>    m_tlasInstanceBuf;
