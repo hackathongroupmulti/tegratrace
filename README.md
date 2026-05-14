@@ -175,18 +175,91 @@ every 60 frames. When a timestamp changes, `Pipeline::tryReload()` calls `vkDevi
 recompiles the pipeline from the new SPIR-V, swaps the `VkPipeline` handle, and destroys the old
 one. Descriptor sets and `VkPipelineLayout` are unchanged. Failures leave the old pipeline intact.
 
-### 8. GPU Frustum Culling
+### 8. Async Compute + GPU Frustum Culling (VK_KHR_timeline_semaphore)
 
-A pre-draw compute pass dispatched each frame:
+When the device exposes a dedicated compute queue family (separate from graphics), the frustum
+culling pass is promoted to async compute:
 
-1. Extracts 6 view-frustum planes from the combined VP matrix (Gribb-Hartmann row method).
-2. Tests each submesh's world-space bounding sphere (precomputed at load time with the fixed model
-   transform applied — no per-frame matrix upload needed).
-3. Writes `instanceCount = 0` for culled submeshes into a per-frame `VkBuffer` that is then used
-   as the indirect draw source. A `VkMemoryBarrier` (`SHADER_WRITE → INDIRECT_COMMAND_READ`)
-   ensures the GPU sees the culled counts before the draw pass reads them.
+1. A second `VkQueue` (compute-only family) is acquired at device creation alongside the graphics queue.
+2. Each frame, the cull dispatch is submitted to the compute queue with a
+   `VkTimelineSemaphoreSubmitInfo` that signals a `VkSemaphore` of type `TIMELINE` to value N.
+3. The graphics queue submission waits on that same timeline semaphore at value N before consuming
+   the culled indirect buffer, replacing the old `VkMemoryBarrier` synchronization.
+4. On hardware without a dedicated compute queue the path degrades transparently to the same-queue
+   barrier approach (no code path divergence in the draw loop).
 
-### 9. VK_KHR_performance_query
+Gribb-Hartmann plane extraction; per-submesh world-space bounding spheres; `instanceCount = 0`
+written for culled draws. No CPU readback.
+
+### 9. Bindless Textures (VK_EXT_descriptor_indexing)
+
+All PBR material textures (albedo, normal, roughness, metallic, AO) and the BRDF LUT are packed
+into a single `sampler2D tex2D[256]` runtime array bound at descriptor set layout creation with:
+
+- `VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT` — only slots actually uploaded are accessed
+- `VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT` — textures can be written to the set after the
+  set is bound, without rebinding between draws
+
+Each submesh's five texture indices (albedoIdx, normalIdx, roughIdx, metallicIdx, aoIdx) and the
+shared BRDF LUT index are pushed via a 92-byte push constant block (`mat4 model` + 7 `uint`s). The
+fragment shader reads `tex2D[pc.albedoIdx]` etc. with `nonuniformEXT` to suppress the implicit
+uniform assumption. One descriptor set per frame-in-flight (not one per submesh) — O(1) bind cost
+regardless of submesh count.
+
+### 10. Ray-Traced Shadows (VK_KHR_ray_query)
+
+Inline ray tracing in the PBR fragment shader using `GL_EXT_ray_query` (no ray pipeline, no SBT):
+
+- **BLAS** — built from the consolidated triangle geometry buffer at load time using
+  `vkCmdBuildAccelerationStructuresKHR` with `GEOMETRY_TYPE_TRIANGLES`. Device-local scratch
+  buffer allocated, used, then freed after the build fence signals.
+- **TLAS** — one instance pointing at the BLAS with a configurable model transform. Written
+  into a `VkAccelerationStructureInstanceKHR` in a host-visible buffer; built on the graphics queue.
+- **Shadow ray** — for each lit fragment where `NdotL > 0`, a shadow ray is fired toward the
+  directional light: `rayQueryInitializeEXT` with `gl_RayFlagsTerminateOnFirstHitEXT |
+  gl_RayFlagsOpaqueEXT`. If `rayQueryGetIntersectionTypeEXT` returns a committed hit, the
+  fragment receives 8% ambient contribution instead of full direct lighting (hard shadow with
+  retained fill light).
+- The `rtEnabled` push constant gates the entire code path — zero performance cost when the TLAS
+  is absent (hardware without RT support, or before `buildRTAccelStructures` is called). The TLAS
+  descriptor binding uses `PARTIALLY_BOUND` so it can be legally absent from the set.
+
+### 11. Mesh Shaders (VK_EXT_mesh_shader)
+
+When supported, the vertex + frustum-cull pipeline for the PBR scene is replaced by a
+task + mesh + fragment pipeline (no vertex input state, no input assembly):
+
+**Meshlet packing (CPU, at load time)**
+- Greedy sequential packer: up to 64 unique vertices and 124 triangles per meshlet
+- Per-meshlet bounding sphere: AABB center ± tight radius (max actual vertex distance from center,
+  not AABB half-diagonal — avoids the up-to-73% overestimate on flat meshlets)
+- Three SSBOs uploaded: `Meshlet[]` structs, meshlet vertex-index refs, meshlet triangle indices
+- The consolidated VBO is additionally flagged `STORAGE_BUFFER_BIT` so the mesh shader can read
+  it as binding 8
+
+**Task shader** (`pbr.task`, SPIR-V 1.4, 32 threads/group)
+- Each thread tests one meshlet's bounding sphere against the MVP frustum (4 side planes in model
+  space via Gribb-Hartmann row extraction)
+- Survivors written to `taskPayloadSharedEXT uint survivingMeshlets[32]` via `atomicAdd`
+- `EmitMeshTasksEXT(s_count, 1, 1)` dispatches exactly as many mesh workgroups as passed culling
+
+**Mesh shader** (`pbr.mesh`, SPIR-V 1.4, 32 threads/group, max 64 verts / 124 prims)
+- Reads `survivingMeshlets[gl_WorkGroupID.x]` from payload
+- Decodes vertices from flat `float vertData[]` (14 floats/vertex: pos[3] + normal[3] + uv[2] +
+  tangent[3] + bitangent[3]) using `vi * 14u + offset` — avoids vec3 std430 alignment mismatch
+- Reconstructs TBN with Gram-Schmidt re-orthogonalization
+- Sets `gl_PrimitiveTriangleIndicesEXT` from the meshlet triangle index buffer
+
+**Draw dispatch**
+- One `vkCmdDrawMeshTasksEXT(numGroups, 1, 1)` per submesh where `numGroups = (meshletCount+31)/32`
+- Push constants extended to 100 bytes: `mat4 model` + 7 PBR tex indices + `meshletOffset` +
+  `meshletCount` (visible to task, mesh, and fragment stages)
+- Separate 9-binding descriptor set layout (vs bindless PBR's 5): bindings 5–8 for the four
+  meshlet SSBOs; separate descriptor pool to avoid layout conflicts
+- Falls back silently to the vertex pipeline when the device lacks `VK_EXT_mesh_shader`
+- Pipeline Inspector panel shows **"VK_EXT_mesh_shader ACTIVE"** in green when the mesh path runs
+
+### 12. VK_KHR_performance_query
 
 `VkPhysicalDevicePerformanceQueryFeaturesKHR` is chained into device creation when the extension
 is available. On initialization, all vendor-specific hardware performance counters are enumerated
@@ -195,7 +268,7 @@ category and description strings. The debug overlay's GPU Performance Counters p
 available counter names by category, giving immediate visibility into what hardware-level metrics
 the platform can collect (e.g., SM utilization, L2 hit rate, instruction throughput).
 
-### 10. Debug UI (Dear ImGui)
+### 13. Debug UI (Dear ImGui)
 
 Live overlay rendered inside the Vulkan render pass via `imgui_impl_vulkan`:
 
@@ -203,7 +276,7 @@ Live overlay rendered inside the Vulkan render pass via `imgui_impl_vulkan`:
 |---|---|
 | Frame Timing | FPS, measured CPU frame time, GPU frame time, rolling graphs, barrier probe, jitter, sync stall flag, spike count |
 | Pipeline Statistics | Draw calls, VS/FS invocations, IA/clip primitives, overdraw ratio |
-| Pipeline Inspector | Active pipeline name |
+| Pipeline Inspector | Active pipeline name; green "VK_EXT_mesh_shader ACTIVE" indicator when mesh path runs |
 | Validation Log | Color-coded messages (error/warning/info) with fix suggestions |
 | Command Buffer Inspector | Draw calls in GPU submission order with vtx/idx counts |
 | Submesh GPU Timings | Per-submesh GPU time as scaled progress bars (scene 3 only) |
@@ -282,14 +355,17 @@ and uploads `tegratrace.exe` as an artifact on every push to `main`.
 src/
   core/        VulkanContext (debug labels, VRAM budget, pipeline cache, VK_KHR_performance_query),
                Window, Swapchain
-  renderer/    Buffer, RenderPass, Pipeline (tryReload), ShaderWatcher, Renderer,
-               PBRModel (IBL compute, mipmaps, GPU frustum culling, GPU-driven indirect, texture cache)
+  renderer/    Buffer, RenderPass, Pipeline (tryReload, buildGraphicsPipeline), ShaderWatcher,
+               Renderer, PBRModel (IBL compute, mipmaps, GPU-driven indirect, texture cache,
+               bindless descriptor heap, BLAS/TLAS, meshlet packer, mesh descriptor sets)
   profiling/   GPUProfiler  — timestamp + pipeline stats, per-submesh timing, spike/jitter detection
   capture/     FrameCapture, FrameReplayer
   validation/  RegressionTester — readback, PSNR, multi-res, heatmap diff
   metrics/     MetricsCollector — FPS, CPU latency percentiles, JSON export
   ui/          DebugUI — 10-panel ImGui overlay
 shaders/       GLSL compiled to SPIR-V by CMake/glslc:
-               pbr.vert/frag, cull.comp, env_to_cube.comp, ibl_prefilter.comp, ibl_irradiance.comp,
+               pbr.vert/frag (SPIR-V 1.4 — GL_EXT_ray_query requires #version 460),
+               pbr.task/mesh (SPIR-V 1.4 — VK_EXT_mesh_shader),
+               cull.comp, env_to_cube.comp, ibl_prefilter.comp, ibl_irradiance.comp,
                triangle.vert/frag, mesh.vert/frag, cube_field.vert
 ```
