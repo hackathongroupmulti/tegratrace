@@ -21,7 +21,9 @@ public:
     void recreate();
 
     VkResult acquireNextImage(uint32_t* imageIndex);
-    VkResult submitAndPresent(uint32_t imageIndex, VkCommandBuffer cmd);
+    // cullSem: optional timeline semaphore that must be waited before DRAW_INDIRECT stage
+    VkResult submitAndPresent(uint32_t imageIndex, VkCommandBuffer cmd,
+                              VkSemaphore cullSem = VK_NULL_HANDLE, uint64_t cullWaitVal = 0);
 
     VkSwapchainKHR           handle()          const { return m_swapchain; }
     VkFormat                 imageFormat()      const { return m_imageFormat; }

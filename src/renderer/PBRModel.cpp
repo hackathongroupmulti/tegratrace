@@ -47,6 +47,20 @@ PBRModel::~PBRModel() {
     m_indirectBuffer.reset();
     m_sphereBuffer.reset();
 
+    if (m_meshDescPool) vkDestroyDescriptorPool(m_ctx.device(), m_meshDescPool, nullptr);
+    m_meshletBuf.reset();
+    m_meshletVertBuf.reset();
+    m_meshletTriBuf.reset();
+
+    // RT acceleration structures (destroy AS handles before their backing buffers)
+    if (m_ctx.rayQuerySupported()) {
+        if (m_tlasHandle) m_ctx.fnDestroyAccelStruct(m_ctx.device(), m_tlasHandle, nullptr);
+        if (m_blasHandle) m_ctx.fnDestroyAccelStruct(m_ctx.device(), m_blasHandle, nullptr);
+    }
+    m_tlasBuffer.reset();
+    m_tlasInstanceBuf.reset();
+    m_blasBuffer.reset();
+
     // Fallback textures
     if (m_fbWhiteView) vkDestroyImageView(m_ctx.device(), m_fbWhiteView, nullptr);
     if (m_fbWhiteImg)  vkDestroyImage(m_ctx.device(), m_fbWhiteImg, nullptr);
@@ -1177,14 +1191,20 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
         VkDeviceSize vsize = allVerts.size()   * sizeof(PBRVertex);
         VkDeviceSize isize = allIndices.size() * sizeof(uint32_t);
 
-        m_consolidatedVBO = std::make_unique<Buffer>(m_ctx, vsize,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // Always add BDA flag (Vulkan 1.2 core). AS build input flag only when RT supported.
+        VkBufferUsageFlags vboFlags = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                    | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        VkBufferUsageFlags iboFlags = VK_BUFFER_USAGE_INDEX_BUFFER_BIT  | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                    | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (m_ctx.rayQuerySupported()) {
+            vboFlags |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+            iboFlags |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        }
+        if (m_ctx.meshShaderSupported())
+            vboFlags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;  // mesh shader reads VBO as SSBO (binding 8)
+        m_consolidatedVBO = std::make_unique<Buffer>(m_ctx, vsize, vboFlags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         m_consolidatedVBO->upload(pool, allVerts.data(), vsize);
-
-        m_consolidatedIBO = std::make_unique<Buffer>(m_ctx, isize,
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        m_consolidatedIBO = std::make_unique<Buffer>(m_ctx, isize, iboFlags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         m_consolidatedIBO->upload(pool, allIndices.data(), isize);
     }
 
@@ -1274,15 +1294,19 @@ bool PBRModel::load(const std::string& fbxPath, VkCommandPool pool) {
               << m_submeshes.size() << " submeshes, "
               << allVerts.size() << " total verts, "
               << m_materials.size() << " materials\n";
+
+    if (m_ctx.meshShaderSupported())
+        buildMeshletsInternal(allVerts, allIndices, pool);
+
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // Descriptor resources (call after load())
 // ---------------------------------------------------------------------------
-void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int framesInFlight) {
+void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int framesInFlight, bool bindless) {
     m_framesInFlight = framesInFlight;
-    uint32_t nSets   = static_cast<uint32_t>(m_submeshes.size() * framesInFlight);
+    m_bindless = bindless;
 
     for (int f = 0; f < framesInFlight; ++f) {
         m_uboBuffers.push_back(std::make_unique<Buffer>(m_ctx,
@@ -1291,82 +1315,212 @@ void PBRModel::createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int 
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
     }
 
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
-    poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = nSets;
-    poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = nSets * kTotalTexBindings;  // 5 material + 3 IBL
-
-    VkDescriptorPoolCreateInfo pci{};
-    pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    pci.pPoolSizes    = poolSizes.data();
-    pci.maxSets       = nSets;
-    VK_CHECK(vkCreateDescriptorPool(m_ctx.device(), &pci, nullptr, &m_descPool));
-
-    std::vector<VkDescriptorSetLayout> layouts(nSets, pbrDSLayout);
-    VkDescriptorSetAllocateInfo ai{};
-    ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    ai.descriptorPool     = m_descPool;
-    ai.descriptorSetCount = nSets;
-    ai.pSetLayouts        = layouts.data();
-    m_descSets.resize(nSets);
-    VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_descSets.data()));
-
-    // IBL views — fall back to white if cubemap generation was skipped
     VkImageView prefilterView  = m_prefilterView  ? m_prefilterView  : m_fbWhiteView;
     VkImageView brdfView       = m_brdfLutView    ? m_brdfLutView    : m_fbWhiteView;
     VkImageView irradianceView = m_irradianceView ? m_irradianceView : m_fbWhiteView;
 
-    for (int s = 0; s < static_cast<int>(m_submeshes.size()); ++s) {
-        int matIdx = m_submeshes[s].materialIdx;
+    // -----------------------------------------------------------------------
+    // Query the pool flags on the layout to detect bindless mode
+    // -----------------------------------------------------------------------
+    {
+        // Check by querying vkGetDescriptorSetLayoutSupport (just try bindless path flag via
+        // allocation to detect) — simpler: caller passes layout created with UPDATE_AFTER_BIND.
+        // We detect bindless by checking if the layout was created with that flag via a test alloc.
+        // Practical approach: store a flag when the layout was created with useBindless=true.
+        // Since we can't query VkDescriptorSetLayout flags, we detect by trying to use bindless
+        // allocation flags and falling back. Instead, the caller sets m_bindless before calling.
+        // (Set via createDescriptorResources overload or by checking pipeline.bindless())
+    }
+
+    if (m_bindless) {
+        // ----------------------------------------------------------------
+        // Bindless path: one descriptor set per frame, all textures in a
+        // sampler2D[] array at binding 1; IBL cubemaps at bindings 2,3
+        // ----------------------------------------------------------------
+        uint32_t nSets = static_cast<uint32_t>(framesInFlight);
+
+        // Assign bindless indices to all unique texture views
+        uint32_t nextIdx = 0;
+
+        // Fallback textures: always indices 0 and 1
+        uint32_t whiteIdx = nextIdx++;
+        uint32_t normIdx  = nextIdx++;
+
+        // Assign indices to all cached material textures
+        for (auto& [path, ct] : m_texCache) {
+            ct.bindlessIdx = nextIdx++;
+        }
+
+        // BRDF LUT gets the next index
+        uint32_t brdfIdx = nextIdx++;
+
+        // Build view → index map for material setup
+        std::unordered_map<VkImageView, uint32_t> viewToIdx;
+        for (const auto& [path, ct] : m_texCache)
+            viewToIdx[ct.view] = ct.bindlessIdx;
+
+        // Compute per-submesh TexIndices
+        m_texIndices.resize(m_submeshes.size());
+        for (int s = 0; s < static_cast<int>(m_submeshes.size()); ++s) {
+            int matIdx = m_submeshes[s].materialIdx;
+            TexIndices& ti = m_texIndices[s];
+            ti.brdfLutIdx = brdfIdx;
+            if (matIdx < 0 || matIdx >= static_cast<int>(m_materials.size())) {
+                ti.albedoIdx = whiteIdx; ti.normalIdx   = normIdx;
+                ti.roughIdx  = whiteIdx; ti.metallicIdx = whiteIdx;
+                ti.aoIdx     = whiteIdx;
+                continue;
+            }
+            const auto& mat = m_materials[matIdx];
+            auto getIdx = [&](int slot, uint32_t fallback) -> uint32_t {
+                if (!mat.hasMap[slot] || mat.views[slot] == VK_NULL_HANDLE) return fallback;
+                auto it = viewToIdx.find(mat.views[slot]);
+                return (it != viewToIdx.end()) ? it->second : fallback;
+            };
+            ti.albedoIdx   = getIdx(kPBRAlbedo,    whiteIdx);
+            ti.normalIdx   = getIdx(kPBRNormal,     normIdx);
+            ti.roughIdx    = getIdx(kPBRRoughness,  whiteIdx);
+            ti.metallicIdx = getIdx(kPBRMetallic,   whiteIdx);
+            ti.aoIdx       = getIdx(kPBRAO,         whiteIdx);
+        }
+
+        // Pool: need UPDATE_AFTER_BIND for the sampler2D[] binding; add AS slot for RT
+        std::vector<VkDescriptorPoolSize> poolSizes;
+        poolSizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<uint32_t>(framesInFlight) });
+        poolSizes.push_back({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              (kMaxBindlessTextures + 2u) * static_cast<uint32_t>(framesInFlight) });
+        if (m_ctx.rayQuerySupported())
+            poolSizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nSets });
+        VkDescriptorPoolCreateInfo pci{};
+        pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pci.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        pci.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        pci.pPoolSizes    = poolSizes.data();
+        pci.maxSets       = nSets;
+        VK_CHECK(vkCreateDescriptorPool(m_ctx.device(), &pci, nullptr, &m_descPool));
+
+        std::vector<VkDescriptorSetLayout> layouts(nSets, pbrDSLayout);
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool     = m_descPool;
+        ai.descriptorSetCount = nSets;
+        ai.pSetLayouts        = layouts.data();
+        m_descSets.resize(nSets);
+        VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_descSets.data()));
+
+        // Build the full image info array for the bindless tex2D[] (up to nextIdx entries)
+        std::vector<VkDescriptorImageInfo> texInfos(nextIdx,
+            { m_sampler, m_fbWhiteView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+        texInfos[normIdx].imageView = m_fbNormView;
+        for (const auto& [path, ct] : m_texCache)
+            texInfos[ct.bindlessIdx].imageView = ct.view;
+        texInfos[brdfIdx].imageView = brdfView;
+
+        VkDescriptorImageInfo prefiltInfo { m_sampler, prefilterView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkDescriptorImageInfo irradInfo   { m_sampler, irradianceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
 
         for (int f = 0; f < framesInFlight; ++f) {
-            VkDescriptorSet ds = m_descSets[s * framesInFlight + f];
+            VkDescriptorSet ds = m_descSets[f];
+            VkDescriptorBufferInfo bi{ m_uboBuffers[f]->handle(), 0, sizeof(PBRUBOData) };
 
-            VkDescriptorBufferInfo bi{};
-            bi.buffer = m_uboBuffers[f]->handle();
-            bi.offset = 0;
-            bi.range  = sizeof(PBRUBOData);
-
-            // Bindings 1-5: per-material textures
-            VkDescriptorImageInfo imgInfos[kTotalTexBindings]{};
-            for (int t = 0; t < kPBRTexCount; ++t) {
-                imgInfos[t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                imgInfos[t].sampler     = m_sampler;
-                VkImageView view = VK_NULL_HANDLE;
-                if (matIdx >= 0 && matIdx < static_cast<int>(m_materials.size())
-                    && m_materials[matIdx].hasMap[t]) {
-                    view = m_materials[matIdx].views[t];
-                }
-                imgInfos[t].imageView = (view != VK_NULL_HANDLE)
-                    ? view
-                    : (t == kPBRNormal ? m_fbNormView : m_fbWhiteView);
-            }
-            // Bindings 6-8: IBL (prefiltered specular cube, BRDF LUT, diffuse irradiance cube)
-            imgInfos[kPBRTexCount + 0] = { m_sampler, prefilterView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            imgInfos[kPBRTexCount + 1] = { m_sampler, brdfView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            imgInfos[kPBRTexCount + 2] = { m_sampler, irradianceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-
-            std::array<VkWriteDescriptorSet, 1 + kTotalTexBindings> writes{};
-            writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[0].dstSet          = ds;
-            writes[0].dstBinding      = 0;
-            writes[0].descriptorCount = 1;
-            writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            writes[0].pBufferInfo     = &bi;
-
-            for (int t = 0; t < kTotalTexBindings; ++t) {
-                writes[1 + t].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[1 + t].dstSet          = ds;
-                writes[1 + t].dstBinding      = static_cast<uint32_t>(1 + t);
-                writes[1 + t].descriptorCount = 1;
-                writes[1 + t].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                writes[1 + t].pImageInfo      = &imgInfos[t];
-            }
+            std::vector<VkWriteDescriptorSet> writes;
+            writes.reserve(4);
+            // Binding 0: UBO
+            VkWriteDescriptorSet wUBO{};
+            wUBO.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wUBO.dstSet = ds; wUBO.dstBinding = 0; wUBO.descriptorCount = 1;
+            wUBO.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            wUBO.pBufferInfo = &bi;
+            writes.push_back(wUBO);
+            // Binding 1: sampler2D[] array (all material textures + BRDF LUT)
+            VkWriteDescriptorSet wTex{};
+            wTex.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wTex.dstSet = ds; wTex.dstBinding = 1; wTex.dstArrayElement = 0;
+            wTex.descriptorCount = static_cast<uint32_t>(texInfos.size());
+            wTex.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            wTex.pImageInfo = texInfos.data();
+            writes.push_back(wTex);
+            // Binding 2: samplerCube prefilt
+            VkWriteDescriptorSet wPref{};
+            wPref.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wPref.dstSet = ds; wPref.dstBinding = 2; wPref.descriptorCount = 1;
+            wPref.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            wPref.pImageInfo = &prefiltInfo;
+            writes.push_back(wPref);
+            // Binding 3: samplerCube irradiance
+            VkWriteDescriptorSet wIrrad{};
+            wIrrad.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wIrrad.dstSet = ds; wIrrad.dstBinding = 3; wIrrad.descriptorCount = 1;
+            wIrrad.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            wIrrad.pImageInfo = &irradInfo;
+            writes.push_back(wIrrad);
 
             vkUpdateDescriptorSets(m_ctx.device(),
                 static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+        std::cout << "[PBRModel] Bindless descriptors: " << nextIdx << " tex2D entries across "
+                  << m_submeshes.size() << " submeshes\n";
+    } else {
+        // ----------------------------------------------------------------
+        // Classic path: one descriptor set per (submesh × frame)
+        // ----------------------------------------------------------------
+        uint32_t nSets = static_cast<uint32_t>(m_submeshes.size() * framesInFlight);
+
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount = nSets;
+        poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount = nSets * kTotalTexBindings;
+
+        VkDescriptorPoolCreateInfo pci{};
+        pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pci.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        pci.pPoolSizes    = poolSizes.data();
+        pci.maxSets       = nSets;
+        VK_CHECK(vkCreateDescriptorPool(m_ctx.device(), &pci, nullptr, &m_descPool));
+
+        std::vector<VkDescriptorSetLayout> layouts(nSets, pbrDSLayout);
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool     = m_descPool;
+        ai.descriptorSetCount = nSets;
+        ai.pSetLayouts        = layouts.data();
+        m_descSets.resize(nSets);
+        VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_descSets.data()));
+
+        for (int s = 0; s < static_cast<int>(m_submeshes.size()); ++s) {
+            int matIdx = m_submeshes[s].materialIdx;
+            for (int f = 0; f < framesInFlight; ++f) {
+                VkDescriptorSet ds = m_descSets[s * framesInFlight + f];
+                VkDescriptorBufferInfo bi{};
+                bi.buffer = m_uboBuffers[f]->handle(); bi.offset = 0; bi.range = sizeof(PBRUBOData);
+
+                VkDescriptorImageInfo imgInfos[kTotalTexBindings]{};
+                for (int t = 0; t < kPBRTexCount; ++t) {
+                    imgInfos[t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    imgInfos[t].sampler     = m_sampler;
+                    VkImageView view = VK_NULL_HANDLE;
+                    if (matIdx >= 0 && matIdx < static_cast<int>(m_materials.size())
+                        && m_materials[matIdx].hasMap[t])
+                        view = m_materials[matIdx].views[t];
+                    imgInfos[t].imageView = (view != VK_NULL_HANDLE)
+                        ? view : (t == kPBRNormal ? m_fbNormView : m_fbWhiteView);
+                }
+                imgInfos[kPBRTexCount + 0] = { m_sampler, prefilterView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                imgInfos[kPBRTexCount + 1] = { m_sampler, brdfView,       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                imgInfos[kPBRTexCount + 2] = { m_sampler, irradianceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+
+                std::array<VkWriteDescriptorSet, 1 + kTotalTexBindings> writes{};
+                writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1,
+                               VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bi, nullptr };
+                for (int t = 0; t < kTotalTexBindings; ++t)
+                    writes[1+t] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds,
+                                    static_cast<uint32_t>(1+t), 0, 1,
+                                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                    &imgInfos[t], nullptr, nullptr };
+                vkUpdateDescriptorSets(m_ctx.device(),
+                    static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            }
         }
     }
 }
@@ -1387,12 +1541,405 @@ void PBRModel::updateUBO(int frameIdx, const float* view16, const float* proj16,
 }
 
 VkDescriptorSet PBRModel::descriptorSet(int submeshIdx, int frameIdx) const {
+    if (m_bindless) return m_descSets[frameIdx];  // one set per frame, shared across submeshes
     return m_descSets[submeshIdx * m_framesInFlight + frameIdx];
+}
+
+const TexIndices& PBRModel::texIndices(int submeshIdx) const {
+    static const TexIndices kDefault{};
+    if (!m_bindless || submeshIdx < 0 || submeshIdx >= static_cast<int>(m_texIndices.size()))
+        return kDefault;
+    return m_texIndices[submeshIdx];
 }
 
 VkBuffer PBRModel::consolidatedVBO() const { return m_consolidatedVBO->handle(); }
 VkBuffer PBRModel::consolidatedIBO() const { return m_consolidatedIBO->handle(); }
 VkBuffer PBRModel::indirectBuffer()  const { return m_indirectBuffer->handle();  }
 VkBuffer PBRModel::sphereBuffer()    const { return m_sphereBuffer->handle();    }
+
+// ---------------------------------------------------------------------------
+// VK_KHR_ray_query: build BLAS (all submeshes merged) then TLAS (one instance)
+// ---------------------------------------------------------------------------
+void PBRModel::buildAccelerationStructures(VkCommandPool pool, const float* modelMat16) {
+    if (!m_ctx.rayQuerySupported() || !m_consolidatedVBO || !m_consolidatedIBO) return;
+
+    const uint32_t totalVertices   = static_cast<uint32_t>(m_consolidatedVBO->size() / sizeof(PBRVertex));
+    const uint32_t totalPrimitives = static_cast<uint32_t>(m_consolidatedIBO->size()  / sizeof(uint32_t) / 3);
+
+    // ---- BLAS ----
+    VkAccelerationStructureGeometryTrianglesDataKHR triData{};
+    triData.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    triData.vertexFormat  = VK_FORMAT_R32G32B32_SFLOAT;
+    triData.vertexData.deviceAddress = m_consolidatedVBO->deviceAddress();
+    triData.vertexStride  = sizeof(PBRVertex);
+    triData.maxVertex     = totalVertices - 1;
+    triData.indexType     = VK_INDEX_TYPE_UINT32;
+    triData.indexData.deviceAddress  = m_consolidatedIBO->deviceAddress();
+
+    VkAccelerationStructureGeometryKHR blasGeom{};
+    blasGeom.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    blasGeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    blasGeom.flags        = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    blasGeom.geometry.triangles = triData;
+
+    VkAccelerationStructureBuildGeometryInfoKHR blasBuildInfo{};
+    blasBuildInfo.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    blasBuildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    blasBuildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    blasBuildInfo.geometryCount = 1;
+    blasBuildInfo.pGeometries   = &blasGeom;
+
+    VkAccelerationStructureBuildSizesInfoKHR blasSizes{};
+    blasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    m_ctx.fnGetAccelBuildSizes(m_ctx.device(),
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &blasBuildInfo, &totalPrimitives, &blasSizes);
+
+    m_blasBuffer = std::make_unique<Buffer>(m_ctx, blasSizes.accelerationStructureSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    VkAccelerationStructureCreateInfoKHR blasCI{};
+    blasCI.sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    blasCI.buffer = m_blasBuffer->handle();
+    blasCI.size   = blasSizes.accelerationStructureSize;
+    blasCI.type   = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    VK_CHECK(m_ctx.fnCreateAccelStruct(m_ctx.device(), &blasCI, nullptr, &m_blasHandle));
+
+    auto blasScratch = std::make_unique<Buffer>(m_ctx, blasSizes.buildScratchSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    blasBuildInfo.mode                    = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    blasBuildInfo.dstAccelerationStructure = m_blasHandle;
+    blasBuildInfo.scratchData.deviceAddress = blasScratch->deviceAddress();
+
+    VkAccelerationStructureBuildRangeInfoKHR blasRange{ totalPrimitives, 0, 0, 0 };
+    const VkAccelerationStructureBuildRangeInfoKHR* pBlasRange = &blasRange;
+
+    {
+        auto cmd = m_ctx.beginSingleTimeCommands(pool);
+        m_ctx.fnCmdBuildAccelStructs(cmd, 1, &blasBuildInfo, &pBlasRange);
+        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR };
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            0, 1, &mb, 0, nullptr, 0, nullptr);
+        m_ctx.endSingleTimeCommands(pool, cmd);
+    }
+    blasScratch.reset();
+
+    // Get BLAS device address for the TLAS instance
+    VkAccelerationStructureDeviceAddressInfoKHR blasAddrInfo{};
+    blasAddrInfo.sType                 = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+    blasAddrInfo.accelerationStructure = m_blasHandle;
+    m_blasDevAddr = m_ctx.fnGetAccelDevAddr(m_ctx.device(), &blasAddrInfo);
+
+    // ---- TLAS ----
+    // Build instance with the caller-supplied model transform (column-major → row-major 3×4)
+    VkAccelerationStructureInstanceKHR inst{};
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+            inst.transform.matrix[r][c] = modelMat16[c * 4 + r];
+    inst.instanceCustomIndex                    = 0;
+    inst.mask                                   = 0xFF;
+    inst.instanceShaderBindingTableRecordOffset = 0;
+    inst.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    inst.accelerationStructureReference         = m_blasDevAddr;
+
+    m_tlasInstanceBuf = std::make_unique<Buffer>(m_ctx, sizeof(VkAccelerationStructureInstanceKHR),
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    m_tlasInstanceBuf->writeHostVisible(&inst, sizeof(inst));
+
+    VkAccelerationStructureGeometryInstancesDataKHR instancesData{};
+    instancesData.sType           = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    instancesData.arrayOfPointers = VK_FALSE;
+    instancesData.data.deviceAddress = m_tlasInstanceBuf->deviceAddress();
+
+    VkAccelerationStructureGeometryKHR tlasGeom{};
+    tlasGeom.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    tlasGeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeom.geometry.instances = instancesData;
+
+    uint32_t instanceCount = 1;
+    VkAccelerationStructureBuildGeometryInfoKHR tlasBuildInfo{};
+    tlasBuildInfo.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    tlasBuildInfo.type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlasBuildInfo.flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    tlasBuildInfo.geometryCount = 1;
+    tlasBuildInfo.pGeometries   = &tlasGeom;
+
+    VkAccelerationStructureBuildSizesInfoKHR tlasSizes{};
+    tlasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    m_ctx.fnGetAccelBuildSizes(m_ctx.device(),
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &tlasBuildInfo, &instanceCount, &tlasSizes);
+
+    m_tlasBuffer = std::make_unique<Buffer>(m_ctx, tlasSizes.accelerationStructureSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    VkAccelerationStructureCreateInfoKHR tlasCI{};
+    tlasCI.sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    tlasCI.buffer = m_tlasBuffer->handle();
+    tlasCI.size   = tlasSizes.accelerationStructureSize;
+    tlasCI.type   = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    VK_CHECK(m_ctx.fnCreateAccelStruct(m_ctx.device(), &tlasCI, nullptr, &m_tlasHandle));
+
+    auto tlasScratch = std::make_unique<Buffer>(m_ctx, tlasSizes.buildScratchSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    tlasBuildInfo.mode                     = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    tlasBuildInfo.dstAccelerationStructure = m_tlasHandle;
+    tlasBuildInfo.scratchData.deviceAddress = tlasScratch->deviceAddress();
+
+    VkAccelerationStructureBuildRangeInfoKHR tlasRange{ 1, 0, 0, 0 };
+    const VkAccelerationStructureBuildRangeInfoKHR* pTlasRange = &tlasRange;
+
+    {
+        auto cmd = m_ctx.beginSingleTimeCommands(pool);
+        m_ctx.fnCmdBuildAccelStructs(cmd, 1, &tlasBuildInfo, &pTlasRange);
+        m_ctx.endSingleTimeCommands(pool, cmd);
+    }
+    tlasScratch.reset();
+
+    m_rtBuilt = true;
+    std::cout << "[PBRModel] BLAS/TLAS built (" << totalPrimitives << " triangles)\n";
+}
+
+void PBRModel::writeTLASDescriptors() {
+    if (!m_rtBuilt) return;
+
+    VkWriteDescriptorSetAccelerationStructureKHR asWrite{};
+    asWrite.sType                      = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+    asWrite.accelerationStructureCount = 1;
+    asWrite.pAccelerationStructures    = &m_tlasHandle;
+
+    // Write binding 4 in both PBR sets and mesh shader sets
+    size_t totalWritten = 0;
+    for (auto* sets : { &m_descSets, &m_meshDescSets }) {
+        for (auto ds : *sets) {
+            VkWriteDescriptorSet w{};
+            w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.pNext           = &asWrite;
+            w.dstSet          = ds;
+            w.dstBinding      = 4;
+            w.descriptorCount = 1;
+            w.descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            vkUpdateDescriptorSets(m_ctx.device(), 1, &w, 0, nullptr);
+            ++totalWritten;
+        }
+    }
+    std::cout << "[PBRModel] TLAS descriptor written to " << totalWritten << " sets\n";
+}
+
+VkDescriptorSet PBRModel::meshDescriptorSet(int frameIdx) const {
+    return m_meshDescSets[static_cast<size_t>(frameIdx)];
+}
+
+// ---------------------------------------------------------------------------
+// VK_EXT_mesh_shader: greedy meshlet packing (64 verts / 124 tris per meshlet)
+// ---------------------------------------------------------------------------
+void PBRModel::buildMeshletsInternal(const std::vector<PBRVertex>& allVerts,
+                                      const std::vector<uint32_t>&  allIndices,
+                                      VkCommandPool pool)
+{
+    static constexpr uint32_t kMaxV = 64;
+    static constexpr uint32_t kMaxT = 124;
+
+    m_meshlets.clear();
+    m_meshletVerts.clear();
+    m_meshletTris.clear();
+    m_submeshMeshletOffsets.resize(m_submeshes.size());
+    m_submeshMeshletCounts.resize(m_submeshes.size());
+
+    for (size_t s = 0; s < m_submeshes.size(); ++s) {
+        const auto& sub = m_submeshes[s];
+        uint32_t fi = sub.firstIndex;
+        uint32_t ic = sub.indexCount;
+        uint32_t vo = static_cast<uint32_t>(sub.vertexOffset);
+
+        m_submeshMeshletOffsets[s] = static_cast<uint32_t>(m_meshlets.size());
+        uint32_t meshletStart = static_cast<uint32_t>(m_meshlets.size());
+
+        uint32_t triIdx = 0;
+        while (triIdx < ic / 3) {
+            Meshlet ml{};
+            ml.vertexOffset   = static_cast<uint32_t>(m_meshletVerts.size());
+            ml.triangleOffset = static_cast<uint32_t>(m_meshletTris.size());
+            ml.vertexCount    = 0;
+            ml.triangleCount  = 0;
+
+            std::unordered_map<uint32_t, uint32_t> localIdx;
+            float minP[3] = { 1e30f,  1e30f,  1e30f };
+            float maxP[3] = {-1e30f, -1e30f, -1e30f };
+
+            while (triIdx < ic / 3 && ml.triangleCount < kMaxT) {
+                uint32_t i0 = allIndices[fi + triIdx*3 + 0] + vo;
+                uint32_t i1 = allIndices[fi + triIdx*3 + 1] + vo;
+                uint32_t i2 = allIndices[fi + triIdx*3 + 2] + vo;
+
+                uint32_t newV = 0;
+                if (!localIdx.count(i0)) ++newV;
+                if (!localIdx.count(i1)) ++newV;
+                if (!localIdx.count(i2)) ++newV;
+                if (ml.vertexCount + newV > kMaxV) break;
+
+                auto addV = [&](uint32_t gi) -> uint32_t {
+                    auto it = localIdx.find(gi);
+                    if (it != localIdx.end()) return it->second;
+                    uint32_t li = ml.vertexCount++;
+                    localIdx[gi] = li;
+                    m_meshletVerts.push_back(gi);
+                    const float* p = allVerts[gi].pos;
+                    for (int a = 0; a < 3; ++a) {
+                        if (p[a] < minP[a]) minP[a] = p[a];
+                        if (p[a] > maxP[a]) maxP[a] = p[a];
+                    }
+                    return li;
+                };
+
+                uint32_t l0 = addV(i0), l1 = addV(i1), l2 = addV(i2);
+                m_meshletTris.push_back(l0);
+                m_meshletTris.push_back(l1);
+                m_meshletTris.push_back(l2);
+                ++ml.triangleCount;
+                ++triIdx;
+            }
+
+            for (int a = 0; a < 3; ++a)
+                ml.sphere[a] = (minP[a] + maxP[a]) * 0.5f;
+            // Tight radius: max actual distance from center to any meshlet vertex
+            float r2 = 0.0f;
+            for (uint32_t vi = 0; vi < ml.vertexCount; ++vi) {
+                uint32_t gi = m_meshletVerts[ml.vertexOffset + vi];
+                const float* p = allVerts[gi].pos;
+                float dx = p[0] - ml.sphere[0];
+                float dy = p[1] - ml.sphere[1];
+                float dz = p[2] - ml.sphere[2];
+                float d2 = dx*dx + dy*dy + dz*dz;
+                if (d2 > r2) r2 = d2;
+            }
+            ml.sphere[3] = std::sqrt(r2);
+
+            m_meshlets.push_back(ml);
+        }
+
+        m_submeshMeshletCounts[s] = static_cast<uint32_t>(m_meshlets.size()) - meshletStart;
+    }
+
+    if (m_meshlets.empty()) return;
+
+    auto upload = [&](const void* data, VkDeviceSize size) -> std::unique_ptr<Buffer> {
+        auto b = std::make_unique<Buffer>(m_ctx, size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        b->upload(pool, data, size);
+        return b;
+    };
+
+    m_meshletBuf     = upload(m_meshlets.data(),     m_meshlets.size()     * sizeof(Meshlet));
+    m_meshletVertBuf = upload(m_meshletVerts.data(),  m_meshletVerts.size() * sizeof(uint32_t));
+    m_meshletTriBuf  = upload(m_meshletTris.data(),   m_meshletTris.size()  * sizeof(uint32_t));
+
+    std::cout << "[PBRModel] Meshlets: " << m_meshlets.size()
+              << " meshlets, " << m_meshletVerts.size() << " vert-refs, "
+              << m_meshletTris.size() / 3 << " triangles\n";
+}
+
+// ---------------------------------------------------------------------------
+// Create descriptor resources for the mesh shader pipeline (9 bindings, 0-8)
+// Must be called after createDescriptorResources() so m_texCache indices are set
+// ---------------------------------------------------------------------------
+void PBRModel::createMeshDescriptorResources(VkDescriptorSetLayout meshLayout,
+                                              int framesInFlight)
+{
+    if (!m_meshletBuf || !m_consolidatedVBO || !m_bindless) return;
+
+    uint32_t nSets = static_cast<uint32_t>(framesInFlight);
+
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    poolSizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nSets });
+    poolSizes.push_back({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          (kMaxBindlessTextures + 2u) * nSets });
+    if (m_ctx.rayQuerySupported())
+        poolSizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nSets });
+    poolSizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4u * nSets });
+
+    VkDescriptorPoolCreateInfo pci{};
+    pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    pci.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    pci.pPoolSizes    = poolSizes.data();
+    pci.maxSets       = nSets;
+    VK_CHECK(vkCreateDescriptorPool(m_ctx.device(), &pci, nullptr, &m_meshDescPool));
+
+    std::vector<VkDescriptorSetLayout> layouts(nSets, meshLayout);
+    VkDescriptorSetAllocateInfo ai{};
+    ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool     = m_meshDescPool;
+    ai.descriptorSetCount = nSets;
+    ai.pSetLayouts        = layouts.data();
+    m_meshDescSets.resize(nSets);
+    VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_meshDescSets.data()));
+
+    // Rebuild the same bindless texture array used by createDescriptorResources
+    uint32_t brdfIdx = m_texIndices.empty() ? 0u : m_texIndices[0].brdfLutIdx;
+    uint32_t totalTex = 2u + static_cast<uint32_t>(m_texCache.size()) + 1u;
+    if (brdfIdx >= totalTex) totalTex = brdfIdx + 1u;
+
+    VkImageView prefilterView  = m_prefilterView  ? m_prefilterView  : m_fbWhiteView;
+    VkImageView irradianceView = m_irradianceView ? m_irradianceView : m_fbWhiteView;
+    VkImageView brdfView       = m_brdfLutView    ? m_brdfLutView    : m_fbWhiteView;
+
+    std::vector<VkDescriptorImageInfo> texInfos(totalTex,
+        { m_sampler, m_fbWhiteView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+    texInfos[1].imageView = m_fbNormView;
+    for (const auto& [path, ct] : m_texCache)
+        if (ct.bindlessIdx < totalTex) texInfos[ct.bindlessIdx].imageView = ct.view;
+    texInfos[brdfIdx].imageView = brdfView;
+
+    VkDescriptorImageInfo prefiltInfo  { m_sampler, prefilterView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo irradInfo    { m_sampler, irradianceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorBufferInfo mlBI  { m_meshletBuf->handle(),     0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo mvBI  { m_meshletVertBuf->handle(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo mtBI  { m_meshletTriBuf->handle(),  0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo vxBI  { m_consolidatedVBO->handle(),0, VK_WHOLE_SIZE };
+
+    for (int f = 0; f < framesInFlight; ++f) {
+        VkDescriptorSet ds = m_meshDescSets[static_cast<size_t>(f)];
+        VkDescriptorBufferInfo uboBI{ m_uboBuffers[static_cast<size_t>(f)]->handle(), 0, sizeof(PBRUBOData) };
+
+        std::vector<VkWriteDescriptorSet> ws;
+        auto addBuf = [&](uint32_t binding, VkDescriptorType type, const VkDescriptorBufferInfo& bi) {
+            VkWriteDescriptorSet w{}; w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = ds; w.dstBinding = binding; w.descriptorCount = 1;
+            w.descriptorType = type; w.pBufferInfo = &bi; ws.push_back(w);
+        };
+        auto addImg = [&](uint32_t binding, uint32_t count, const VkDescriptorImageInfo* ii) {
+            VkWriteDescriptorSet w{}; w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = ds; w.dstBinding = binding; w.descriptorCount = count;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = ii; ws.push_back(w);
+        };
+
+        addBuf(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uboBI);
+        addImg(1, static_cast<uint32_t>(texInfos.size()), texInfos.data());
+        addImg(2, 1, &prefiltInfo);
+        addImg(3, 1, &irradInfo);
+        addBuf(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mlBI);
+        addBuf(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mvBI);
+        addBuf(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, mtBI);
+        addBuf(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, vxBI);
+
+        vkUpdateDescriptorSets(m_ctx.device(),
+            static_cast<uint32_t>(ws.size()), ws.data(), 0, nullptr);
+    }
+    std::cout << "[PBRModel] Mesh shader descriptors created (" << framesInFlight << " frames)\n";
+}
 
 } // namespace tgt

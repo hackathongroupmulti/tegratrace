@@ -35,6 +35,7 @@ struct UIFrameData {
     uint64_t    clippingPrims   = 0;
     float       overdrawRatio   = 0.0f;
     std::string pipelineName;
+    bool        meshShaderActive  = false;  // true when VK_EXT_mesh_shader path is executing
     std::vector<DrawCallSummary> drawCallList;
 
     // Per-submesh GPU timings (scene 3 only)

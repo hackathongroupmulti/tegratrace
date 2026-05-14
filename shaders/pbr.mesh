@@ -1,0 +1,95 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 64, max_primitives = 124) out;
+
+// Receives surviving meshlet indices from the task shader
+taskPayloadSharedEXT uint survivingMeshlets[32];
+
+struct Meshlet {
+    uint  vertexOffset;
+    uint  triangleOffset;
+    uint  vertexCount;
+    uint  triangleCount;
+    vec4  sphere;
+};
+
+layout(set = 0, binding = 0) uniform UBO {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPos;
+    vec4 lightDir;
+    vec4 lightColor;
+} ubo;
+
+// Bindless material textures, IBL cubemaps, TLAS — shared with fragment shader
+layout(set = 0, binding = 1) uniform sampler2D tex2D[];
+layout(set = 0, binding = 2) uniform samplerCube texEnvPrefiltered;
+layout(set = 0, binding = 3) uniform samplerCube texIrradiance;
+
+layout(set = 0, binding = 5) readonly buffer MeshletBuf     { Meshlet meshlets[];     };
+layout(set = 0, binding = 6) readonly buffer MeshletVertBuf { uint    meshletVerts[];  };
+layout(set = 0, binding = 7) readonly buffer MeshletTriBuf  { uint    meshletTris[];   };
+// Consolidated VBO as flat float array: 14 floats per vertex (pos, normal, uv, tangent, bitangent)
+layout(std430, set = 0, binding = 8) readonly buffer VertexBuf { float vertData[]; };
+
+layout(push_constant) uniform PC {
+    mat4  model;
+    uint  albedoIdx;
+    uint  normalIdx;
+    uint  roughIdx;
+    uint  metallicIdx;
+    uint  aoIdx;
+    uint  brdfLutIdx;
+    uint  rtEnabled;
+    uint  meshletOffset;
+    uint  meshletCount;
+} pc;
+
+// Per-vertex outputs — match pbr.frag inputs (locations 0, 1, 2 which covers 2,3,4 for mat3)
+layout(location = 0) out vec3 fragWorldPos[];
+layout(location = 1) out vec2 fragUV[];
+layout(location = 2) out mat3 fragTBN[];   // occupies locations 2, 3, 4
+
+void main() {
+    uint meshletIdx = survivingMeshlets[gl_WorkGroupID.x];
+    Meshlet m = meshlets[meshletIdx];
+
+    SetMeshOutputsEXT(m.vertexCount, m.triangleCount);
+
+    mat3 normalMat = transpose(inverse(mat3(pc.model)));
+
+    // Emit vertices — each thread handles stride-32 elements
+    for (uint i = gl_LocalInvocationIndex; i < m.vertexCount; i += 32u) {
+        uint vi  = meshletVerts[m.vertexOffset + i];
+        uint base = vi * 14u;
+
+        vec3 pos    = vec3(vertData[base + 0u], vertData[base + 1u], vertData[base + 2u]);
+        vec3 normal = vec3(vertData[base + 3u], vertData[base + 4u], vertData[base + 5u]);
+        vec2 uv     = vec2(vertData[base + 6u], vertData[base + 7u]);
+        vec3 tang   = vec3(vertData[base + 8u], vertData[base + 9u], vertData[base + 10u]);
+
+        vec4 worldPos = pc.model * vec4(pos, 1.0);
+        gl_MeshVerticesEXT[i].gl_Position = ubo.proj * ubo.view * worldPos;
+
+        fragWorldPos[i] = worldPos.xyz;
+        fragUV[i]       = uv;
+
+        vec3 N = normalize(normalMat * normal);
+        vec3 T = normalize(normalMat * tang);
+        T = normalize(T - dot(T, N) * N);
+        vec3 B = cross(N, T);
+        fragTBN[i] = mat3(T, B, N);
+    }
+
+    // Emit triangle indices
+    for (uint i = gl_LocalInvocationIndex; i < m.triangleCount; i += 32u) {
+        uint base = m.triangleOffset + i * 3u;
+        gl_PrimitiveTriangleIndicesEXT[i] = uvec3(
+            meshletTris[base + 0u],
+            meshletTris[base + 1u],
+            meshletTris[base + 2u]
+        );
+    }
+}

@@ -6,24 +6,36 @@
 namespace tgt {
 
 Buffer::Buffer(VulkanContext& ctx, VkDeviceSize size,
-               VkBufferUsageFlags usage, VkMemoryPropertyFlags props)
+               VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
+               const std::vector<uint32_t>& sharingFamilies)
     : m_ctx(ctx), m_size(size)
 {
     VkBufferCreateInfo bi{};
-    bi.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size        = size;
-    bi.usage       = usage;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size  = size;
+    bi.usage = usage;
+    if (sharingFamilies.size() >= 2) {
+        bi.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+        bi.queueFamilyIndexCount = static_cast<uint32_t>(sharingFamilies.size());
+        bi.pQueueFamilyIndices   = sharingFamilies.data();
+    } else {
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    }
     if (vkCreateBuffer(ctx.device(), &bi, nullptr, &m_buffer) != VK_SUCCESS)
         throw std::runtime_error("Failed to create buffer");
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(ctx.device(), m_buffer, &req);
 
+    VkMemoryAllocateFlagsInfo mafi{};
+    mafi.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    mafi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
     VkMemoryAllocateInfo ai{};
     ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize  = req.size;
     ai.memoryTypeIndex = ctx.findMemoryType(req.memoryTypeBits, props);
+    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ai.pNext = &mafi;
     if (vkAllocateMemory(ctx.device(), &ai, nullptr, &m_memory) != VK_SUCCESS)
         throw std::runtime_error("Failed to allocate buffer memory");
 
@@ -46,6 +58,13 @@ void Buffer::upload(VkCommandPool pool, const void* data, VkDeviceSize size) {
     VkBufferCopy region{ 0, 0, size };
     vkCmdCopyBuffer(cmd, staging.handle(), m_buffer, 1, &region);
     m_ctx.endSingleTimeCommands(pool, cmd);
+}
+
+VkDeviceAddress Buffer::deviceAddress() const {
+    VkBufferDeviceAddressInfo info{};
+    info.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    info.buffer = m_buffer;
+    return vkGetBufferDeviceAddress(m_ctx.device(), &info);
 }
 
 void Buffer::writeHostVisible(const void* data, VkDeviceSize size) {

@@ -105,17 +105,31 @@ int main(int argc, char** argv) {
             meshCfg.vertSpvPath = path("shaders/mesh.vert.spv");
             meshCfg.fragSpvPath = path("shaders/mesh.frag.spv");
 
-            // PBR pipeline: Cook-Torrance + 5 material maps + 3 IBL (prefiltered, BRDF LUT, irradiance)
+            // PBR pipeline: bindless sampler2D[] heap + IBL cubemaps at fixed bindings 2,3
             tgt::PipelineConfig pbrCfg{};
-            pbrCfg.vertSpvPath          = path("shaders/pbr.vert.spv");
-            pbrCfg.fragSpvPath          = path("shaders/pbr.frag.spv");
-            pbrCfg.textureBindingCount  = 8;  // albedo, normal, roughness, metallic, AO, prefilter, brdf_lut, irradiance
-            pbrCfg.usePBRVertex         = true;
-            pbrCfg.cullMode             = VK_CULL_MODE_NONE; // double-sided for hair/cloth
+            pbrCfg.vertSpvPath   = path("shaders/pbr.vert.spv");
+            pbrCfg.fragSpvPath   = path("shaders/pbr.frag.spv");
+            pbrCfg.usePBRVertex  = true;
+            pbrCfg.cullMode      = VK_CULL_MODE_NONE; // double-sided for hair/cloth
+            pbrCfg.useBindless   = true; // VK_EXT_descriptor_indexing: runtime sampler2D array
+
+            // Mesh shader pipeline: task+mesh+frag replacing vertex+cull when supported
+            tgt::PipelineConfig meshShaderCfg{};
+            meshShaderCfg.taskSpvPath  = path("shaders/pbr.task.spv");
+            meshShaderCfg.meshSpvPath  = path("shaders/pbr.mesh.spv");
+            meshShaderCfg.fragSpvPath  = path("shaders/pbr.frag.spv");
+            meshShaderCfg.cullMode     = VK_CULL_MODE_NONE;
+            meshShaderCfg.useBindless  = true;
+            meshShaderCfg.useMeshShader = true;
 
             tgt::Pipeline    pipeline(ctx, renderPass, swapchain.extent(), pipelineCfg);
             tgt::Pipeline    meshPipeline(ctx, renderPass, swapchain.extent(), meshCfg);
             tgt::Pipeline    pbrPipeline(ctx, renderPass, swapchain.extent(), pbrCfg);
+            std::unique_ptr<tgt::Pipeline> meshShaderPipeline;
+            if (ctx.meshShaderSupported())
+                meshShaderPipeline = std::make_unique<tgt::Pipeline>(
+                    ctx, renderPass, swapchain.extent(), meshShaderCfg);
+
             tgt::Renderer    renderer(ctx, swapchain, renderPass, pipeline);
             renderer.setScene(cfg.scene);
             renderer.setMeshPipeline(&meshPipeline);
@@ -124,6 +138,10 @@ int main(int argc, char** argv) {
             if (!cfg.fbxPath.empty()) {
                 renderer.loadPBRModel(cfg.fbxPath);
                 renderer.setupCullPipeline(path("shaders/cull.comp.spv"));
+                if (ctx.rayQuerySupported())
+                    renderer.buildRTAccelStructures();
+                if (meshShaderPipeline)
+                    renderer.setupMeshShaderPipeline(meshShaderPipeline.get());
             }
 
             tgt::GPUProfiler      profiler(ctx, tgt::Swapchain::kMaxFramesInFlight);
@@ -207,9 +225,12 @@ int main(int argc, char** argv) {
                                 ? static_cast<float>(rep.pipelineStats.fragmentShaderInvocations) / static_cast<float>(pixels)
                                 : 0.0f;
                         }
-                        data.pipelineName = (cfg.scene == 3) ? pbrPipeline.name()
-                                          : (cfg.scene == 2) ? meshPipeline.name()
-                                          : pipeline.name();
+                        data.meshShaderActive = (cfg.scene == 3) && meshShaderPipeline
+                                             && ctx.meshShaderSupported();
+                        data.pipelineName = (cfg.scene == 3)
+                            ? (data.meshShaderActive ? "pbr.mesh" : pbrPipeline.name())
+                            : (cfg.scene == 2) ? meshPipeline.name()
+                            : pipeline.name();
                         // VK_EXT_memory_budget: per-heap VRAM usage
                         {
                             auto budget = ctx.queryMemoryBudget();

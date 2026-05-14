@@ -163,9 +163,13 @@ void DebugUI::panelVRAMBudget(const UIFrameData& data) {
 
 void DebugUI::panelPipelineInspector(const UIFrameData& data) {
     ImGui::SetNextWindowPos({10, 415}, ImGuiCond_Once);
-    ImGui::SetNextWindowSize({310, 55}, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({310, 70}, ImGuiCond_Once);
     ImGui::Begin("Pipeline Inspector");
     ImGui::Text("Active  %s", data.pipelineName.c_str());
+    if (data.meshShaderActive)
+        ImGui::TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "VK_EXT_mesh_shader  ACTIVE");
+    else
+        ImGui::TextColored({0.6f, 0.6f, 0.6f, 1.0f}, "Vertex pipeline (mesh shader N/A)");
     ImGui::End();
 }
 

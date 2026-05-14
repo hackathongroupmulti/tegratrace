@@ -10,7 +10,9 @@ namespace tgt {
 struct QueueFamilyIndices {
     std::optional<uint32_t> graphics;
     std::optional<uint32_t> present;
-    bool isComplete() const { return graphics.has_value() && present.has_value(); }
+    std::optional<uint32_t> compute;  // dedicated async compute family (no graphics)
+    bool isComplete()       const { return graphics.has_value() && present.has_value(); }
+    bool hasAsyncCompute()  const { return compute.has_value(); }
 };
 
 struct SwapchainSupportDetails {
@@ -51,7 +53,9 @@ public:
     VkDevice           device()          const { return m_device; }
     VkQueue            graphicsQueue()   const { return m_graphicsQueue; }
     VkQueue            presentQueue()    const { return m_presentQueue; }
+    VkQueue            computeQueue()    const { return m_computeQueue; }
     QueueFamilyIndices queueFamilies()   const { return m_queueFamilies; }
+    bool               hasAsyncCompute() const { return m_queueFamilies.hasAsyncCompute(); }
 
     SwapchainSupportDetails querySwapchainSupport(VkSurfaceKHR surface) const;
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags props) const;
@@ -81,6 +85,21 @@ public:
     void loadPipelineCache(const std::string& path);
     void savePipelineCache(const std::string& path) const;
 
+    // VK_EXT_mesh_shader: task + mesh pipeline stages replacing vertex+cull
+    bool meshShaderSupported() const { return m_meshShaderSupported; }
+    PFN_vkCmdDrawMeshTasksEXT fnCmdDrawMeshTasks = nullptr;
+
+    // VK_KHR_ray_query: inline ray tracing in fragment shaders (all four extensions required)
+    bool rayQuerySupported()   const { return m_rayQuerySupported; }
+    VkDeviceAddress getBufferDeviceAddress(VkBuffer buf) const;
+
+    // RT function pointers — non-null when rayQuerySupported() == true
+    PFN_vkCreateAccelerationStructureKHR           fnCreateAccelStruct    = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR          fnDestroyAccelStruct   = nullptr;
+    PFN_vkGetAccelerationStructureBuildSizesKHR    fnGetAccelBuildSizes   = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR        fnCmdBuildAccelStructs = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR fnGetAccelDevAddr      = nullptr;
+
     // VK_KHR_performance_query: hardware counter enumeration (optional, read-only)
     struct PerfCounter {
         std::string name;
@@ -101,6 +120,7 @@ private:
 
     bool checkValidationLayerSupport() const;
     bool isDeviceSuitable(VkPhysicalDevice dev, VkSurfaceKHR surface) const;
+    void loadRTFunctions();
     int  scoreDevice(VkPhysicalDevice dev) const;
     QueueFamilyIndices findQueueFamilies(VkPhysicalDevice dev, VkSurfaceKHR surface) const;
     bool checkDeviceExtensionSupport(VkPhysicalDevice dev) const;
@@ -117,11 +137,14 @@ private:
     VkDevice                 m_device         = VK_NULL_HANDLE;
     VkQueue                  m_graphicsQueue  = VK_NULL_HANDLE;
     VkQueue                  m_presentQueue   = VK_NULL_HANDLE;
+    VkQueue                  m_computeQueue   = VK_NULL_HANDLE;
     QueueFamilyIndices       m_queueFamilies;
     float                    m_timestampPeriod = 1.0f;
     bool                     m_validation;
     bool                     m_headless;
-    bool                     m_memBudgetSupported = false;
+    bool                     m_memBudgetSupported  = false;
+    bool                     m_rayQuerySupported   = false;
+    bool                     m_meshShaderSupported = false;
 
     // Nsight/RenderDoc: vkCmdBegin/EndDebugUtilsLabelEXT function pointers
     PFN_vkCmdBeginDebugUtilsLabelEXT  m_fnBeginLabel  = nullptr;

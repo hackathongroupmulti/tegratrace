@@ -8,8 +8,16 @@ layout(binding = 0) uniform PBRUniform {
     vec4 lightColor; // xyz = colour, w = intensity
 } ubo;
 
-layout(push_constant) uniform PushConstants {
+// Full push constant block shared with fragment shader (must match PBRDrawPC in Renderer.cpp)
+layout(push_constant) uniform PC {
     mat4 model;
+    uint albedoIdx;
+    uint normalIdx;
+    uint roughIdx;
+    uint metallicIdx;
+    uint aoIdx;
+    uint brdfLutIdx;
+    uint rtEnabled;   // 1 = shoot shadow ray via VK_KHR_ray_query, 0 = no shadow
 } pc;
 
 layout(location = 0) in vec3 inPosition;

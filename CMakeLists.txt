@@ -87,7 +87,22 @@ function(compile_shader TARGET SHADER)
     add_custom_command(
         OUTPUT  ${SPV_FILE}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
-        COMMAND ${GLSLC} ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPV_FILE}
+        COMMAND ${GLSLC} --target-env=vulkan1.2 ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPV_FILE}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
+        VERBATIM
+    )
+    target_sources(${TARGET} PRIVATE ${SPV_FILE})
+endfunction()
+
+# Ray-query shaders need SPIR-V 1.4 (VK_KHR_ray_query inline)
+function(compile_shader_spv14 TARGET SHADER)
+    get_filename_component(SHADER_NAME ${SHADER} NAME)
+    set(SPV_FILE "${CMAKE_CURRENT_BINARY_DIR}/shaders/${SHADER_NAME}.spv")
+    add_custom_command(
+        OUTPUT  ${SPV_FILE}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+        COMMAND ${GLSLC} --target-env=vulkan1.2 --target-spv=spv1.4
+                ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPV_FILE}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
         VERBATIM
     )
@@ -147,11 +162,13 @@ if(GLSLC)
     compile_shader(tegratrace shaders/mesh.frag)
     compile_shader(tegratrace shaders/cube_field.vert)
     compile_shader(tegratrace shaders/pbr.vert)
-    compile_shader(tegratrace shaders/pbr.frag)
+    compile_shader_spv14(tegratrace shaders/pbr.frag)  # GL_EXT_ray_query requires SPIR-V 1.4
     compile_shader(tegratrace shaders/cull.comp)
     compile_shader(tegratrace shaders/env_to_cube.comp)
     compile_shader(tegratrace shaders/ibl_prefilter.comp)
     compile_shader(tegratrace shaders/ibl_irradiance.comp)
+    compile_shader_spv14(tegratrace shaders/pbr.task)  # VK_EXT_mesh_shader requires SPIR-V 1.4
+    compile_shader_spv14(tegratrace shaders/pbr.mesh)
     add_custom_command(TARGET tegratrace POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_BINARY_DIR}/shaders"

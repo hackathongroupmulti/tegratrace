@@ -17,8 +17,15 @@ const std::vector<const char*> VulkanContext::kDeviceExtensions = {
 };
 
 // Optional device extensions
-static constexpr const char* kMemBudgetExt  = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
-static constexpr const char* kPerfQueryExt  = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME;
+static constexpr const char* kMemBudgetExt    = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+static constexpr const char* kPerfQueryExt    = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME;
+// Ray tracing (all four required together)
+static constexpr const char* kRayQueryExt     = VK_KHR_RAY_QUERY_EXTENSION_NAME;
+static constexpr const char* kAccelStructExt  = VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
+static constexpr const char* kDeferredHostExt = VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
+static constexpr const char* kBufDevAddrExt   = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+// Mesh shading (task + mesh stages replacing vertex+cull)
+static constexpr const char* kMeshShaderExt   = VK_EXT_MESH_SHADER_EXTENSION_NAME;
 
 #define VK_CHECK(x) do { \
     VkResult _r = (x); \
@@ -185,6 +192,13 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice dev, VkSurf
     // In headless mode (no surface), the graphics queue handles everything
     if (surface == VK_NULL_HANDLE && indices.graphics.has_value())
         indices.present = indices.graphics;
+
+    // Second pass: find dedicated async compute family (COMPUTE without GRAPHICS)
+    for (uint32_t i = 0; i < count; ++i) {
+        bool hasCompute  = (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)  != 0;
+        bool hasGraphics = (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        if (hasCompute && !hasGraphics) { indices.compute = i; break; }
+    }
     return indices;
 }
 
@@ -193,6 +207,8 @@ void VulkanContext::createLogicalDevice() {
         m_queueFamilies.graphics.value(),
         m_queueFamilies.present.value()
     };
+    if (m_queueFamilies.compute.has_value())
+        uniqueQueues.insert(m_queueFamilies.compute.value());
 
     float priority = 1.0f;
     std::vector<VkDeviceQueueCreateInfo> queueCIs;
@@ -224,22 +240,82 @@ void VulkanContext::createLogicalDevice() {
         vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &count, nullptr);
         std::vector<VkExtensionProperties> available(count);
         vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &count, available.data());
+        bool hasRayQuery = false, hasAccelStruct = false, hasDeferredHost = false, hasBufDevAddr = false;
+        bool hasMeshShader = false;
         for (auto& ext : available) {
             std::string name = ext.extensionName;
-            if (name == kMemBudgetExt) { devExts.push_back(kMemBudgetExt); m_memBudgetSupported = true; }
-            if (name == kPerfQueryExt) { devExts.push_back(kPerfQueryExt); perfFeatures.performanceCounterQueryPools = VK_TRUE; m_perfQuerySupported = true; }
+            if (name == kMemBudgetExt)    { devExts.push_back(kMemBudgetExt);    m_memBudgetSupported = true; }
+            if (name == kPerfQueryExt)    { devExts.push_back(kPerfQueryExt);    perfFeatures.performanceCounterQueryPools = VK_TRUE; m_perfQuerySupported = true; }
+            if (name == kRayQueryExt)     hasRayQuery    = true;
+            if (name == kAccelStructExt)  hasAccelStruct = true;
+            if (name == kDeferredHostExt) hasDeferredHost = true;
+            if (name == kBufDevAddrExt)   hasBufDevAddr  = true;
+            if (name == kMeshShaderExt)   hasMeshShader  = true;
         }
+        if (hasRayQuery && hasAccelStruct && hasDeferredHost && hasBufDevAddr) {
+            devExts.push_back(kRayQueryExt);
+            devExts.push_back(kAccelStructExt);
+            devExts.push_back(kDeferredHostExt);
+            devExts.push_back(kBufDevAddrExt);
+            m_rayQuerySupported = true;
+        }
+        if (hasMeshShader) {
+            devExts.push_back(kMeshShaderExt);
+            m_meshShaderSupported = true;
+        }
+    }
+
+    // Vulkan 1.2 features: timeline semaphores (core) + descriptor indexing (for bindless)
+    VkPhysicalDeviceVulkan12Features vk12Features{};
+    vk12Features.sType                                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vk12Features.timelineSemaphore                         = VK_TRUE;
+    vk12Features.descriptorIndexing                        = VK_TRUE;
+    vk12Features.runtimeDescriptorArray                    = VK_TRUE;
+    vk12Features.descriptorBindingPartiallyBound           = VK_TRUE;
+    vk12Features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    vk12Features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    vk12Features.bufferDeviceAddress                       = VK_TRUE;  // required for AS builds
+
+    // Optional RT feature structs — only populated when all four extensions are present
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeat{};
+    VkPhysicalDeviceRayQueryFeaturesKHR rqFeat{};
+    if (m_rayQuerySupported) {
+        asFeat.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+        asFeat.accelerationStructure = VK_TRUE;
+        rqFeat.sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+        rqFeat.rayQuery = VK_TRUE;
+        asFeat.pNext    = &rqFeat;
+    }
+
+    // Mesh shader feature struct (VK_EXT_mesh_shader)
+    VkPhysicalDeviceMeshShaderFeaturesEXT meshFeat{};
+    if (m_meshShaderSupported) {
+        meshFeat.sType      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+        meshFeat.meshShader = VK_TRUE;
+        meshFeat.taskShader = VK_TRUE;
+    }
+
+    // Chain: vk12Features → perfFeatures (opt) → asFeat (opt) → meshFeat (opt) → end
+    void* chainTail = m_meshShaderSupported ? static_cast<void*>(&meshFeat) : nullptr;
+    if (m_rayQuerySupported) {
+        asFeat.pNext = chainTail;   // RT tail links into mesh (or end)
+        chainTail    = &asFeat;
+    }
+    if (m_perfQuerySupported) {
+        vk12Features.pNext = &perfFeatures;
+        perfFeatures.pNext = chainTail;
+    } else {
+        vk12Features.pNext = chainTail;
     }
 
     VkDeviceCreateInfo ci{};
     ci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    ci.pNext                   = &vk12Features;
     ci.queueCreateInfoCount    = static_cast<uint32_t>(queueCIs.size());
     ci.pQueueCreateInfos       = queueCIs.data();
     ci.enabledExtensionCount   = static_cast<uint32_t>(devExts.size());
     ci.ppEnabledExtensionNames = devExts.empty() ? nullptr : devExts.data();
     ci.pEnabledFeatures        = &features;
-    if (m_perfQuerySupported)
-        ci.pNext = &perfFeatures;
     if (m_validation) {
         ci.enabledLayerCount   = static_cast<uint32_t>(kValidationLayers.size());
         ci.ppEnabledLayerNames = kValidationLayers.data();
@@ -248,6 +324,10 @@ void VulkanContext::createLogicalDevice() {
     VK_CHECK(vkCreateDevice(m_physicalDevice, &ci, nullptr, &m_device));
     vkGetDeviceQueue(m_device, m_queueFamilies.graphics.value(), 0, &m_graphicsQueue);
     vkGetDeviceQueue(m_device, m_queueFamilies.present.value(), 0, &m_presentQueue);
+    if (m_queueFamilies.compute.has_value()) {
+        vkGetDeviceQueue(m_device, m_queueFamilies.compute.value(), 0, &m_computeQueue);
+        std::cout << "[TegraTrace] Async compute queue: family " << m_queueFamilies.compute.value() << "\n";
+    }
 
     loadDebugLabelFunctions();
 
@@ -270,6 +350,15 @@ void VulkanContext::createLogicalDevice() {
         std::cout << "[TegraTrace] VK_EXT_memory_budget enabled\n";
     if (m_fnBeginLabel)
         std::cout << "[TegraTrace] VkCmdDebugUtilsLabel functions loaded (Nsight/RenderDoc ready)\n";
+    if (m_rayQuerySupported) {
+        loadRTFunctions();
+        std::cout << "[TegraTrace] VK_KHR_ray_query + acceleration structures enabled\n";
+    }
+    if (m_meshShaderSupported) {
+        fnCmdDrawMeshTasks = (PFN_vkCmdDrawMeshTasksEXT)
+            vkGetDeviceProcAddr(m_device, "vkCmdDrawMeshTasksEXT");
+        std::cout << "[TegraTrace] VK_EXT_mesh_shader enabled (task + mesh stages)\n";
+    }
 }
 
 SwapchainSupportDetails VulkanContext::querySwapchainSupport(VkSurfaceKHR surface) const {
@@ -513,6 +602,29 @@ void VulkanContext::enumeratePerfCounters() {
         pc.description = descs[i].description;
         m_perfCounters.push_back(std::move(pc));
     }
+}
+
+// ---------------------------------------------------------------------------
+// VK_KHR_ray_query: load extension function pointers + BDA helper
+// ---------------------------------------------------------------------------
+void VulkanContext::loadRTFunctions() {
+    fnCreateAccelStruct    = (PFN_vkCreateAccelerationStructureKHR)
+        vkGetDeviceProcAddr(m_device, "vkCreateAccelerationStructureKHR");
+    fnDestroyAccelStruct   = (PFN_vkDestroyAccelerationStructureKHR)
+        vkGetDeviceProcAddr(m_device, "vkDestroyAccelerationStructureKHR");
+    fnGetAccelBuildSizes   = (PFN_vkGetAccelerationStructureBuildSizesKHR)
+        vkGetDeviceProcAddr(m_device, "vkGetAccelerationStructureBuildSizesKHR");
+    fnCmdBuildAccelStructs = (PFN_vkCmdBuildAccelerationStructuresKHR)
+        vkGetDeviceProcAddr(m_device, "vkCmdBuildAccelerationStructuresKHR");
+    fnGetAccelDevAddr      = (PFN_vkGetAccelerationStructureDeviceAddressKHR)
+        vkGetDeviceProcAddr(m_device, "vkGetAccelerationStructureDeviceAddressKHR");
+}
+
+VkDeviceAddress VulkanContext::getBufferDeviceAddress(VkBuffer buf) const {
+    VkBufferDeviceAddressInfo info{};
+    info.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    info.buffer = buf;
+    return vkGetBufferDeviceAddress(m_device, &info);
 }
 
 } // namespace tgt

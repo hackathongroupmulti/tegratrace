@@ -1,0 +1,84 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+struct Meshlet {
+    uint  vertexOffset;
+    uint  triangleOffset;
+    uint  vertexCount;
+    uint  triangleCount;
+    vec4  sphere;   // xyz = center in model space, w = radius
+};
+
+layout(set = 0, binding = 0) uniform UBO {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPos;
+    vec4 lightDir;
+    vec4 lightColor;
+} ubo;
+
+layout(set = 0, binding = 5) readonly buffer MeshletBuf { Meshlet meshlets[]; };
+
+layout(push_constant) uniform PC {
+    mat4  model;
+    uint  albedoIdx;
+    uint  normalIdx;
+    uint  roughIdx;
+    uint  metallicIdx;
+    uint  aoIdx;
+    uint  brdfLutIdx;
+    uint  rtEnabled;
+    uint  meshletOffset;
+    uint  meshletCount;
+} pc;
+
+taskPayloadSharedEXT uint survivingMeshlets[32];
+shared uint s_count;
+
+// Returns true if the model-space sphere is potentially visible in the frustum.
+// Frustum planes are extracted from MVP and tested in model space.
+bool frustumCull(vec3 center, float radius) {
+    mat4 mvp = ubo.proj * ubo.view * pc.model;
+
+    // Extract row vectors (GLSL mat4 is column-major: mvp[col][row])
+    vec4 row0 = vec4(mvp[0][0], mvp[1][0], mvp[2][0], mvp[3][0]);
+    vec4 row1 = vec4(mvp[0][1], mvp[1][1], mvp[2][1], mvp[3][1]);
+    vec4 row3 = vec4(mvp[0][3], mvp[1][3], mvp[2][3], mvp[3][3]);
+
+    // Four side frustum planes in model space (left, right, bottom, top)
+    vec4 planes[4];
+    planes[0] = row3 + row0;
+    planes[1] = row3 - row0;
+    planes[2] = row3 + row1;
+    planes[3] = row3 - row1;
+
+    vec4 c4 = vec4(center, 1.0);
+    for (int i = 0; i < 4; ++i) {
+        float len = length(planes[i].xyz);
+        float dist = dot(planes[i], c4) / len;
+        if (dist < -radius) return false;
+    }
+    return true;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u)
+        s_count = 0u;
+    barrier();
+
+    uint tid = gl_LocalInvocationIndex;
+    uint meshletIdx = pc.meshletOffset + gl_WorkGroupID.x * 32u + tid;
+
+    if (meshletIdx < pc.meshletOffset + pc.meshletCount) {
+        Meshlet m = meshlets[meshletIdx];
+        if (frustumCull(m.sphere.xyz, m.sphere.w)) {
+            uint slot = atomicAdd(s_count, 1u);
+            survivingMeshlets[slot] = meshletIdx;
+        }
+    }
+    barrier();
+
+    EmitMeshTasksEXT(s_count, 1u, 1u);
+}

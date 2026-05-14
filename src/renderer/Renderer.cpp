@@ -392,7 +392,8 @@ void Renderer::loadPBRModel(const std::string& fbxPath) {
     }
     if (m_pbrPipeline) {
         m_pbrModel->createDescriptorResources(
-            m_pbrPipeline->dsLayout(), Swapchain::kMaxFramesInFlight);
+            m_pbrPipeline->dsLayout(), Swapchain::kMaxFramesInFlight,
+            m_pbrPipeline->bindless());
     }
 }
 
@@ -416,6 +417,8 @@ static VkShaderModule loadSpvModule(VkDevice device, const std::string& path) {
 }
 
 void Renderer::destroyCullPipeline() {
+    if (m_cullTimelineSem) { vkDestroySemaphore(m_ctx.device(), m_cullTimelineSem, nullptr); m_cullTimelineSem = VK_NULL_HANDLE; }
+    if (m_computeCmdPool) { vkDestroyCommandPool(m_ctx.device(), m_computeCmdPool, nullptr); m_computeCmdPool = VK_NULL_HANDLE; m_computeCmdBufs.clear(); }
     m_cullDescSets.clear();
     m_cullUBOBuffers.clear();
     m_culledIndirectBufs.clear();
@@ -489,6 +492,13 @@ void Renderer::setupCullPipeline(const std::string& cullSpvPath) {
     m_cullDescSets.resize(FIF);
     VK_CHECK(vkAllocateDescriptorSets(m_ctx.device(), &ai, m_cullDescSets.data()));
 
+    // For async compute, culled indirect buffers need concurrent sharing between compute and graphics
+    std::vector<uint32_t> indirectSharing;
+    if (m_ctx.hasAsyncCompute()) {
+        indirectSharing = { m_ctx.queueFamilies().graphics.value(),
+                            m_ctx.queueFamilies().compute.value() };
+    }
+
     // Per-frame UBO and culled indirect buffers; write descriptor sets
     struct CullParams { float viewProj[16]; uint32_t drawCount; uint32_t pad[3]; };
     for (int f = 0; f < FIF; ++f) {
@@ -497,7 +507,7 @@ void Renderer::setupCullPipeline(const std::string& cullSpvPath) {
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
         m_culledIndirectBufs.push_back(std::make_unique<Buffer>(m_ctx, indSize,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indirectSharing));
 
         VkDescriptorBufferInfo srcInfo{ m_pbrModel->indirectBuffer(), 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo dstInfo{ m_culledIndirectBufs[f]->handle(), 0, VK_WHOLE_SIZE };
@@ -517,6 +527,35 @@ void Renderer::setupCullPipeline(const std::string& cullSpvPath) {
         writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; writes[3].pBufferInfo = &uboInfo;
         vkUpdateDescriptorSets(m_ctx.device(), 4, writes.data(), 0, nullptr);
     }
+    // Async compute: create dedicated compute command pool, command buffers, and timeline semaphore
+    if (m_ctx.hasAsyncCompute()) {
+        VkCommandPoolCreateInfo cpci{};
+        cpci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.queueFamilyIndex = m_ctx.queueFamilies().compute.value();
+        cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        VK_CHECK(vkCreateCommandPool(m_ctx.device(), &cpci, nullptr, &m_computeCmdPool));
+
+        m_computeCmdBufs.resize(FIF);
+        VkCommandBufferAllocateInfo cai{};
+        cai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cai.commandPool        = m_computeCmdPool;
+        cai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = FIF;
+        VK_CHECK(vkAllocateCommandBuffers(m_ctx.device(), &cai, m_computeCmdBufs.data()));
+
+        VkSemaphoreTypeCreateInfo tsci{};
+        tsci.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+        tsci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        tsci.initialValue  = 0;
+        VkSemaphoreCreateInfo sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        sci.pNext = &tsci;
+        VK_CHECK(vkCreateSemaphore(m_ctx.device(), &sci, nullptr, &m_cullTimelineSem));
+        m_cullTimelineVal = 0;
+        std::cout << "[Renderer] Async compute cull enabled (timeline semaphore, queue family "
+                  << m_ctx.queueFamilies().compute.value() << ")\n";
+    }
+
     std::cout << "[Renderer] GPU frustum-culling compute pipeline ready ("
               << drawCount << " submeshes)\n";
 }
@@ -597,6 +636,32 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     rbi.clearValueCount = static_cast<uint32_t>(clearValues.size());
     rbi.pClearValues    = clearValues.data();
 
+    // PRE-PASS: inline frustum culling — must be OUTSIDE the render pass.
+    // Skipped when async compute is active (cull was dispatched on compute queue in drawFrame).
+    if (isPBRScene && m_cullPipeline && !m_culledIndirectBufs.empty() && !m_cullTimelineSem) {
+        uint32_t fi2 = profIdx;
+        struct CullParams { float viewProj[16]; uint32_t drawCount; uint32_t pad[3]; };
+        glm::mat4 vp2 = glm::make_mat4(m_currentProj) * glm::make_mat4(m_currentView);
+        CullParams cp{};
+        std::memcpy(cp.viewProj, glm::value_ptr(vp2), 64);
+        cp.drawCount = m_pbrModel->drawCount();
+        m_cullUBOBuffers[fi2]->writeHostVisible(&cp, sizeof(cp));
+
+        uint32_t groups = (cp.drawCount + 63) / 64;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cullPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_cullLayout, 0, 1, &m_cullDescSets[fi2], 0, nullptr);
+        vkCmdDispatch(cmd, groups, 1, 1);
+
+        VkMemoryBarrier cullBarrier{};
+        cullBarrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        cullBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        cullBarrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+            0, 1, &cullBarrier, 0, nullptr, 0, nullptr);
+    }
+
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.handle());
 
@@ -665,38 +730,71 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
         vkCmdBindIndexBuffer(cmd, m_meshIndexBuffer->handle(), 0, VK_INDEX_TYPE_UINT32);
     }
 
-    // ---- Scene 3: PBR multi-submesh model — GPU-driven indirect ----
+    // ---- Scene 3: PBR multi-submesh model — mesh shader OR GPU-driven indirect ----
     if (isPBRScene) {
-        // GPU frustum culling: run compute outside the render pass, then barrier
-        if (m_cullPipeline && !m_culledIndirectBufs.empty()) {
-            uint32_t fi2 = profIdx; // same slot as profIdx
-            // Update frustum cull UBO (viewProj matrix + drawCount)
-            struct CullParams { float viewProj[16]; uint32_t drawCount; uint32_t pad[3]; };
-            glm::mat4 vp = glm::make_mat4(m_currentProj) * glm::make_mat4(m_currentView);
-            CullParams cp{};
-            std::memcpy(cp.viewProj, glm::value_ptr(vp), 64);
-            cp.drawCount = m_pbrModel->drawCount();
-            m_cullUBOBuffers[fi2]->writeHostVisible(&cp, sizeof(cp));
+        m_lastDrawCalls.clear();
+        const bool useMeshShader = m_meshShaderPipeline &&
+                                   m_pbrModel->meshletCount() > 0 &&
+                                   m_ctx.fnCmdDrawMeshTasks;
 
-            // Dispatch: 1 workgroup per 64 submeshes (cull.comp local_size_x=64)
-            uint32_t groups = (cp.drawCount + 63) / 64;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cullPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                m_cullLayout, 0, 1, &m_cullDescSets[fi2], 0, nullptr);
-            vkCmdDispatch(cmd, groups, 1, 1);
+        if (useMeshShader) {
+            // Task+mesh pipeline: one DrawMeshTasksEXT per submesh for per-submesh material indices
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_meshShaderPipeline->handle());
 
-            // Barrier: compute SSBO write → indirect draw read
-            VkMemoryBarrier mb{};
-            mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                0, 1, &mb, 0, nullptr, 0, nullptr);
+            glm::mat4 modelMat = glm::scale(glm::mat4(1.0f), glm::vec3(0.01f));
+            modelMat = glm::rotate(modelMat, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+
+            uint32_t fi = frameIdx % Swapchain::kMaxFramesInFlight;
+            VkDescriptorSet meshSet = m_pbrModel->meshDescriptorSet(static_cast<int>(fi));
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_meshShaderPipeline->layout(), 0, 1, &meshSet, 0, nullptr);
+
+            m_ctx.beginDebugLabel(cmd, "PBR_Mesh", 0.8f, 0.4f, 0.8f);
+
+            struct MeshDrawPC {
+                float    model[16];
+                uint32_t albedoIdx, normalIdx, roughIdx, metallicIdx, aoIdx, brdfLutIdx;
+                uint32_t rtEnabled;
+                uint32_t meshletOffset;
+                uint32_t meshletCount;
+            };
+
+            for (int s = 0; s < static_cast<int>(m_pbrModel->submeshes().size()); ++s) {
+                const auto& sub = m_pbrModel->submeshes()[s];
+                uint32_t mc = m_pbrModel->submeshMeshletCount(s);
+                if (mc == 0) continue;
+
+                MeshDrawPC dpc{};
+                std::memcpy(dpc.model, glm::value_ptr(modelMat), 64);
+                const auto& ti = m_pbrModel->texIndices(s);
+                dpc.albedoIdx    = ti.albedoIdx;
+                dpc.normalIdx    = ti.normalIdx;
+                dpc.roughIdx     = ti.roughIdx;
+                dpc.metallicIdx  = ti.metallicIdx;
+                dpc.aoIdx        = ti.aoIdx;
+                dpc.brdfLutIdx   = ti.brdfLutIdx;
+                dpc.rtEnabled    = m_rtEnabled ? 1u : 0u;
+                dpc.meshletOffset = m_pbrModel->submeshMeshletOffset(s);
+                dpc.meshletCount  = mc;
+
+                vkCmdPushConstants(cmd, m_meshShaderPipeline->layout(),
+                    VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT |
+                    VK_SHADER_STAGE_FRAGMENT_BIT, 0, 100, &dpc);
+
+                uint32_t numGroups = (mc + 31u) / 32u;
+                m_ctx.fnCmdDrawMeshTasks(cmd, numGroups, 1, 1);
+
+                stats.drawCalls++;
+                stats.indexCount += sub.indexCount;
+            }
+            m_ctx.endDebugLabel(cmd);
+
+            if (m_frameCallback) m_frameCallback(frameNumber, cmd, stats);
+            vkCmdEndRenderPass(cmd);
+            VK_CHECK(vkEndCommandBuffer(cmd));
+            return cmd;
         }
 
-        m_lastDrawCalls.clear();
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pbrPipeline->handle());
 
         // XPS FBX is Z-up, centimetre units → rotate -90° on X, scale to metres
@@ -722,12 +820,35 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
             // Nsight/RenderDoc: each submesh gets its own colour-coded label
             m_ctx.beginDebugLabel(cmd, passName.c_str(), 0.4f, 0.6f, 1.0f);
 
-            VkDescriptorSet ds = m_pbrModel->descriptorSet(s, fi);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                m_pbrPipeline->layout(), 0, 1, &ds, 0, nullptr);
+            // Bindless: bind once before the loop; classic: bind per-submesh
+            if (!m_pbrPipeline->bindless() || s == 0) {
+                VkDescriptorSet ds = m_pbrModel->descriptorSet(s, fi);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    m_pbrPipeline->layout(), 0, 1, &ds, 0, nullptr);
+            }
 
-            vkCmdPushConstants(cmd, m_pbrPipeline->layout(),
-                VK_SHADER_STAGE_VERTEX_BIT, 0, 64, glm::value_ptr(modelMat));
+            if (m_pbrPipeline->bindless()) {
+                // Push model matrix + 6 tex indices + rtEnabled (92 bytes, vert|frag stages)
+                struct PBRDrawPC {
+                    float    model[16];
+                    uint32_t albedoIdx, normalIdx, roughIdx, metallicIdx, aoIdx, brdfLutIdx;
+                    uint32_t rtEnabled;
+                } dpc{};
+                std::memcpy(dpc.model, glm::value_ptr(modelMat), 64);
+                const auto& ti = m_pbrModel->texIndices(s);
+                dpc.albedoIdx   = ti.albedoIdx;
+                dpc.normalIdx   = ti.normalIdx;
+                dpc.roughIdx    = ti.roughIdx;
+                dpc.metallicIdx = ti.metallicIdx;
+                dpc.aoIdx       = ti.aoIdx;
+                dpc.brdfLutIdx  = ti.brdfLutIdx;
+                dpc.rtEnabled   = m_rtEnabled ? 1u : 0u;
+                vkCmdPushConstants(cmd, m_pbrPipeline->layout(),
+                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 92, &dpc);
+            } else {
+                vkCmdPushConstants(cmd, m_pbrPipeline->layout(),
+                    VK_SHADER_STAGE_VERTEX_BIT, 0, 64, glm::value_ptr(modelMat));
+            }
 
             // GPU-driven: draw from culled buffer if compute cull is active
             VkBuffer indBuf = (!m_culledIndirectBufs.empty())
@@ -886,17 +1007,83 @@ bool Renderer::drawFrame(uint32_t frameNumber) {
                               camPos4, kLightDir, kLightColor);
     }
 
+    // Async compute: dispatch frustum cull on dedicated compute queue before graphics work.
+    // The timeline semaphore ensures graphics DRAW_INDIRECT stage waits for cull completion.
+    if (m_ctx.hasAsyncCompute() && m_cullTimelineSem && m_scene == 3 &&
+        m_pbrModel && m_pbrModel->isLoaded() && m_cullPipeline && !m_culledIndirectBufs.empty()) {
+        uint32_t fi2 = frameIdx % Swapchain::kMaxFramesInFlight;
+        struct CullParams { float viewProj[16]; uint32_t drawCount; uint32_t pad[3]; };
+        glm::mat4 mvp = glm::make_mat4(m_currentProj) * glm::make_mat4(m_currentView);
+        CullParams cp{};
+        std::memcpy(cp.viewProj, glm::value_ptr(mvp), 64);
+        cp.drawCount = m_pbrModel->drawCount();
+        m_cullUBOBuffers[fi2]->writeHostVisible(&cp, sizeof(cp));
+
+        VkCommandBuffer ccmd = m_computeCmdBufs[fi2];
+        vkResetCommandBuffer(ccmd, 0);
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(ccmd, &bi);
+
+        uint32_t groups = (cp.drawCount + 63) / 64;
+        vkCmdBindPipeline(ccmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cullPipeline);
+        vkCmdBindDescriptorSets(ccmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_cullLayout, 0, 1, &m_cullDescSets[fi2], 0, nullptr);
+        vkCmdDispatch(ccmd, groups, 1, 1);
+        vkEndCommandBuffer(ccmd);
+
+        uint64_t signalVal = ++m_cullTimelineVal;
+        VkTimelineSemaphoreSubmitInfo tssi{};
+        tssi.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        tssi.signalSemaphoreValueCount = 1;
+        tssi.pSignalSemaphoreValues    = &signalVal;
+        VkSubmitInfo csi{};
+        csi.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        csi.pNext                = &tssi;
+        csi.commandBufferCount   = 1;
+        csi.pCommandBuffers      = &ccmd;
+        csi.signalSemaphoreCount = 1;
+        csi.pSignalSemaphores    = &m_cullTimelineSem;
+        VK_CHECK(vkQueueSubmit(m_ctx.computeQueue(), 1, &csi, VK_NULL_HANDLE));
+    }
+
     FrameDrawStats stats{};
     auto cmd = recordCommandBuffer(imageIndex, frameNumber, stats);
     m_lastFrameStats = stats;
 
-    result = m_swapchain.submitAndPresent(imageIndex, cmd);
+    VkSemaphore passSem = (m_cullTimelineSem && m_scene == 3) ? m_cullTimelineSem : VK_NULL_HANDLE;
+    result = m_swapchain.submitAndPresent(imageIndex, cmd, passSem, m_cullTimelineVal);
     if (result == VK_ERROR_OUT_OF_DATE_KHR) { handleResize(); return false; }
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
         throw std::runtime_error("submitAndPresent failed");
 
     m_frameCount++;
     return true;
+}
+
+void Renderer::setupMeshShaderPipeline(Pipeline* p) {
+    if (!m_pbrModel || !m_pbrModel->meshletCount() || !p) return;
+    m_meshShaderPipeline = p;
+    m_pbrModel->createMeshDescriptorResources(p->dsLayout(), Swapchain::kMaxFramesInFlight);
+    std::cout << "[Renderer] Mesh shader pipeline ready ("
+              << m_pbrModel->meshletCount() << " meshlets across "
+              << m_pbrModel->submeshes().size() << " submeshes)\n";
+}
+
+void Renderer::buildRTAccelStructures() {
+    if (!m_pbrModel || !m_pbrModel->isLoaded() || !m_ctx.rayQuerySupported()) return;
+
+    // Use the same model transform applied in recordCommandBuffer for scene 3
+    glm::mat4 modelMat = glm::scale(glm::mat4(1.0f), glm::vec3(0.01f));
+    modelMat = glm::rotate(modelMat, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+
+    m_pbrModel->buildAccelerationStructures(m_commandPool, glm::value_ptr(modelMat));
+    if (m_pbrModel->rtBuilt()) {
+        m_pbrModel->writeTLASDescriptors();
+        m_rtEnabled = true;
+        std::cout << "[Renderer] Ray-traced shadows enabled (VK_KHR_ray_query)\n";
+    }
 }
 
 void Renderer::handleResize() {

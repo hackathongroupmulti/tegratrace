@@ -1,6 +1,8 @@
-#version 450
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_ray_query           : require
 
-layout(binding = 0) uniform PBRUniform {
+layout(set = 0, binding = 0) uniform PBRUniform {
     mat4 view;
     mat4 proj;
     vec4 cameraPos;
@@ -8,16 +10,25 @@ layout(binding = 0) uniform PBRUniform {
     vec4 lightColor; // xyz = colour, w = intensity
 } ubo;
 
-// Per-material texture maps (bindings 1-5)
-layout(binding = 1) uniform sampler2D texAlbedo;
-layout(binding = 2) uniform sampler2D texNormal;
-layout(binding = 3) uniform sampler2D texRoughness;
-layout(binding = 4) uniform sampler2D texMetallic;
-layout(binding = 5) uniform sampler2D texAO;
-// IBL resources (bindings 6-8, shared across all submeshes)
-layout(binding = 6) uniform samplerCube texEnvPrefiltered; // GGX specular prefilter cubemap
-layout(binding = 7) uniform sampler2D   texBrdfLut;        // split-sum LUT: (NdotV, roughness) → (scale, bias)
-layout(binding = 8) uniform samplerCube texIrradiance;     // diffuse irradiance cubemap
+// Bindless 2D texture heap: material maps + BRDF LUT at pc.brdfLutIdx
+layout(set = 0, binding = 1) uniform sampler2D tex2D[];
+// Fixed IBL cubemap bindings (shared across all submeshes)
+layout(set = 0, binding = 2) uniform samplerCube texEnvPrefiltered; // GGX specular prefilter
+layout(set = 0, binding = 3) uniform samplerCube texIrradiance;     // diffuse irradiance
+// TLAS for inline ray queries (binding 4, partially bound — only valid when rtEnabled != 0)
+layout(set = 0, binding = 4) uniform accelerationStructureEXT tlas;
+
+// Push constants: mat4 model (vert) + 6 bindless texture indices + rtEnabled (frag)
+layout(push_constant) uniform PC {
+    mat4 model;
+    uint albedoIdx;
+    uint normalIdx;
+    uint roughIdx;
+    uint metallicIdx;
+    uint aoIdx;
+    uint brdfLutIdx;
+    uint rtEnabled;
+} pc;
 
 layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec2 fragUV;
@@ -53,15 +64,16 @@ vec3 F_Schlick(float cosTheta, vec3 F0) {
 }
 
 void main() {
-    vec4 albedoSample = texture(texAlbedo, fragUV);
+    // Sample material maps via bindless indices
+    vec4 albedoSample = texture(tex2D[nonuniformEXT(pc.albedoIdx)],   fragUV);
 
     // Alpha test: discard near-transparent pixels (hair / ATOC meshes)
     if (albedoSample.a < 0.1) discard;
 
-    float roughness = max(texture(texRoughness, fragUV).r, 0.04);
-    float metallic  = texture(texMetallic,  fragUV).r;
-    float ao        = texture(texAO,        fragUV).r;
-    vec3  normalTS  = texture(texNormal,    fragUV).rgb * 2.0 - 1.0;
+    float roughness = max(texture(tex2D[nonuniformEXT(pc.roughIdx)],    fragUV).r, 0.04);
+    float metallic  = texture(tex2D[nonuniformEXT(pc.metallicIdx)],     fragUV).r;
+    float ao        = texture(tex2D[nonuniformEXT(pc.aoIdx)],           fragUV).r;
+    vec3  normalTS  = texture(tex2D[nonuniformEXT(pc.normalIdx)],       fragUV).rgb * 2.0 - 1.0;
 
     vec3 albedo = albedoSample.rgb;
 
@@ -87,22 +99,35 @@ void main() {
     vec3 diffuse = kD * albedo / PI;
 
     vec3 lightRad = ubo.lightColor.rgb * ubo.lightColor.w;
-    vec3 Lo = (diffuse + specular) * lightRad * NdotL;
 
-    // IBL split-sum ambient (cubemap IBL: prefiltered specular + diffuse irradiance)
+    // Ray-traced hard shadow: shoot a shadow ray toward the directional light.
+    // rtEnabled is pushed as 1 when the TLAS is built and bound; otherwise 0 (no shadow ray).
+    float shadow = 1.0;
+    if (pc.rtEnabled != 0u && NdotL > 0.0) {
+        vec3 shadowOrigin = fragWorldPos + N * 0.005;  // small bias along surface normal
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas,
+            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+            0xFF, shadowOrigin, 0.001, L, 200.0);
+        while (rayQueryProceedEXT(rq)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+            shadow = 0.08;  // retain ambient contribution even in shadow
+    }
+
+    vec3 Lo = (diffuse + specular) * lightRad * NdotL * shadow;
+
+    // IBL split-sum ambient
     vec3 kS_ibl = F_Schlick(NdotV, F0);
     vec3 kD_ibl = (vec3(1.0) - kS_ibl) * (1.0 - metallic);
 
-    // Diffuse IBL: sample precomputed irradiance cubemap at surface normal
     vec3 irradiance = texture(texIrradiance, N).rgb;
     vec3 diffuseIBL = kD_ibl * irradiance * albedo;
 
-    // Specular IBL: sample GGX prefiltered cubemap; LOD selects roughness mip (0=mirror, 7=full diffuse)
     vec3 R = reflect(-V, N);
     vec3 prefSpec = textureLod(texEnvPrefiltered, R, roughness * 7.0).rgb;
 
-    // BRDF LUT encodes (scale, bias) for the Fresnel term in split-sum form
-    vec2 brdfSample = texture(texBrdfLut, vec2(NdotV, roughness)).rg;
+    // BRDF LUT also lives in the bindless 2D heap
+    vec2 brdfSample = texture(tex2D[nonuniformEXT(pc.brdfLutIdx)], vec2(NdotV, roughness)).rg;
     vec3 specularIBL = prefSpec * (kS_ibl * brdfSample.x + brdfSample.y);
 
     vec3 ambient = (diffuseIBL + specularIBL) * ao;

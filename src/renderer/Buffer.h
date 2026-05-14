@@ -9,7 +9,8 @@ class VulkanContext;
 class Buffer {
 public:
     Buffer(VulkanContext& ctx, VkDeviceSize size,
-           VkBufferUsageFlags usage, VkMemoryPropertyFlags props);
+           VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
+           const std::vector<uint32_t>& sharingFamilies = {});
     ~Buffer();
 
     Buffer(const Buffer&) = delete;
@@ -18,8 +19,9 @@ public:
     void upload(VkCommandPool pool, const void* data, VkDeviceSize size);
     void writeHostVisible(const void* data, VkDeviceSize size);
 
-    VkBuffer       handle() const { return m_buffer; }
-    VkDeviceSize   size()   const { return m_size; }
+    VkBuffer        handle()        const { return m_buffer; }
+    VkDeviceSize    size()          const { return m_size; }
+    VkDeviceAddress deviceAddress() const;
 
 private:
     VulkanContext& m_ctx;

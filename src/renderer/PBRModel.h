@@ -5,22 +5,43 @@
 #include <memory>
 #include <array>
 #include <unordered_map>
+#include "Buffer.h"
 
 namespace tgt {
 
 class VulkanContext;
-class Buffer;
 
 // Indices into the per-material texture array (bindings 1-5 in the shader)
-static constexpr int kPBRTexCount     = 5;
-static constexpr int kPBRAlbedo       = 0;  // binding 1: _D
-static constexpr int kPBRNormal       = 1;  // binding 2: _N
-static constexpr int kPBRRoughness    = 2;  // binding 3: _R
-static constexpr int kPBRMetallic     = 3;  // binding 4: _M
-static constexpr int kPBRAO           = 4;  // binding 5: _AO
-// IBL textures (bindings 6-8, shared across all submeshes)
-static constexpr int kIBLTexCount     = 3;
-static constexpr int kTotalTexBindings = kPBRTexCount + kIBLTexCount;  // 8
+static constexpr int kPBRTexCount      = 5;
+static constexpr int kPBRAlbedo        = 0;
+static constexpr int kPBRNormal        = 1;
+static constexpr int kPBRRoughness     = 2;
+static constexpr int kPBRMetallic      = 3;
+static constexpr int kPBRAO            = 4;
+// IBL textures (classic layout bindings 6-8)
+static constexpr int kIBLTexCount      = 3;
+static constexpr int kTotalTexBindings = kPBRTexCount + kIBLTexCount;  // 8 (classic layout)
+// Bindless: max descriptors in the sampler2D[] array
+static constexpr uint32_t kMaxBindlessTextures = 256;
+
+// Meshlet: packed geometry for VK_EXT_mesh_shader task/mesh pipeline (max 64 verts, 124 tris)
+struct Meshlet {
+    uint32_t vertexOffset;    // first index into meshlet vertex buffer
+    uint32_t triangleOffset;  // first index into meshlet triangle buffer (3 per tri)
+    uint32_t vertexCount;     // <= 64
+    uint32_t triangleCount;   // <= 124
+    float    sphere[4];       // xyz = center in model space, w = radius
+};
+
+// Per-submesh bindless texture indices pushed via push constants
+struct TexIndices {
+    uint32_t albedoIdx   = 0;
+    uint32_t normalIdx   = 0;
+    uint32_t roughIdx    = 0;
+    uint32_t metallicIdx = 0;
+    uint32_t aoIdx       = 0;
+    uint32_t brdfLutIdx  = 0;
+};
 
 // Matches the UBO layout in pbr.vert / pbr.frag
 struct PBRUBOData {
@@ -57,15 +78,35 @@ public:
     // Load FBX via Assimp; must be called before createDescriptorResources
     bool load(const std::string& fbxPath, VkCommandPool pool);
 
-    // Allocate per-(submesh,frame) descriptor sets from the PBR pipeline's layout
-    void createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int framesInFlight);
+    // Allocate descriptor sets from the PBR pipeline's layout.
+    // bindless=true: one set per frame with sampler2D[] array; false: one set per (submesh×frame)
+    void createDescriptorResources(VkDescriptorSetLayout pbrDSLayout, int framesInFlight,
+                                   bool bindless = false);
+
+    // Ray tracing: build BLAS/TLAS from consolidated geometry; call after load().
+    // modelMat16 = column-major float[16] transform applied to the TLAS instance.
+    void buildAccelerationStructures(VkCommandPool pool, const float* modelMat16);
+    void writeTLASDescriptors();     // update binding 4 in all desc sets (PBR + mesh) after TLAS build
+    bool rtBuilt() const { return m_rtBuilt; }
+
+    // Mesh shaders: create per-frame descriptor sets for the mesh pipeline layout (bindings 0-8).
+    // Must be called after createDescriptorResources() (reuses bindless index assignments).
+    void createMeshDescriptorResources(VkDescriptorSetLayout meshLayout, int framesInFlight);
+    VkDescriptorSet meshDescriptorSet(int frameIdx) const;
+    uint32_t meshletCount()                    const { return static_cast<uint32_t>(m_meshlets.size()); }
+    uint32_t submeshMeshletOffset(int s)       const { return m_submeshMeshletOffsets[static_cast<size_t>(s)]; }
+    uint32_t submeshMeshletCount(int s)        const { return m_submeshMeshletCounts[static_cast<size_t>(s)]; }
 
     // Upload view/proj/camera/light to the per-frame UBO for the given frame slot
     void updateUBO(int frameIdx, const float* view16, const float* proj16,
                    const float* cameraPos4, const float* lightDir4, const float* lightColor4);
 
-    // Retrieve descriptor set for a specific (submesh, frame) pair
+    // Retrieve descriptor set: with bindless, returns the frame-level set (submeshIdx ignored)
     VkDescriptorSet descriptorSet(int submeshIdx, int frameIdx) const;
+
+    // Bindless: per-submesh texture indices for push constants
+    const TexIndices& texIndices(int submeshIdx) const;
+    bool              isBindless() const { return m_bindless; }
 
     const std::vector<PBRSubmesh>& submeshes() const { return m_submeshes; }
     bool isLoaded() const { return !m_submeshes.empty(); }
@@ -99,9 +140,10 @@ private:
 
     // Texture cache: resolved absolute path → GPU objects (shared across materials)
     struct CachedTexture {
-        VkImage        image  = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView    view   = VK_NULL_HANDLE;
+        VkImage        image       = VK_NULL_HANDLE;
+        VkDeviceMemory memory      = VK_NULL_HANDLE;
+        VkImageView    view        = VK_NULL_HANDLE;
+        uint32_t       bindlessIdx = 0;  // index into tex2D[] when bindless
     };
     std::unordered_map<std::string, CachedTexture> m_texCache;
 
@@ -153,10 +195,40 @@ private:
     // Per-frame UBO buffers
     std::vector<std::unique_ptr<Buffer>> m_uboBuffers;
 
-    // Flat list: index = submeshIdx * m_framesInFlight + frameIdx
+    // Flat list: index = submeshIdx * m_framesInFlight + frameIdx (classic) or frameIdx (bindless)
     VkDescriptorPool             m_descPool = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> m_descSets;
     int m_framesInFlight = 0;
+
+    // Bindless path: one TexIndices per submesh, m_bindless flag
+    bool                     m_bindless    = false;
+    std::vector<TexIndices>  m_texIndices;
+
+    // Mesh shader meshlet data (built during load() when meshShaderSupported)
+    void buildMeshletsInternal(const std::vector<PBRVertex>& verts,
+                               const std::vector<uint32_t>& indices,
+                               VkCommandPool pool);
+    std::vector<Meshlet>   m_meshlets;
+    std::vector<uint32_t>  m_meshletVerts;  // vertex indices into consolidated VBO
+    std::vector<uint32_t>  m_meshletTris;   // local vertex indices per triangle (3 per tri)
+    std::vector<uint32_t>  m_submeshMeshletOffsets;
+    std::vector<uint32_t>  m_submeshMeshletCounts;
+    std::unique_ptr<Buffer> m_meshletBuf;
+    std::unique_ptr<Buffer> m_meshletVertBuf;
+    std::unique_ptr<Buffer> m_meshletTriBuf;
+
+    // Descriptor resources for mesh shader pipeline (separate from m_descPool/m_descSets)
+    VkDescriptorPool             m_meshDescPool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> m_meshDescSets;
+
+    // Ray tracing acceleration structures
+    VkAccelerationStructureKHR m_blasHandle = VK_NULL_HANDLE;
+    std::unique_ptr<Buffer>    m_blasBuffer;
+    VkDeviceAddress            m_blasDevAddr = 0;
+    VkAccelerationStructureKHR m_tlasHandle = VK_NULL_HANDLE;
+    std::unique_ptr<Buffer>    m_tlasBuffer;
+    std::unique_ptr<Buffer>    m_tlasInstanceBuf;
+    bool                       m_rtBuilt = false;
 };
 
 } // namespace tgt

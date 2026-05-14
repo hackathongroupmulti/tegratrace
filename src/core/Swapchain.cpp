@@ -135,18 +135,31 @@ VkResult Swapchain::acquireNextImage(uint32_t* imageIndex) {
                                   VK_NULL_HANDLE, imageIndex);
 }
 
-VkResult Swapchain::submitAndPresent(uint32_t imageIndex, VkCommandBuffer cmd) {
+VkResult Swapchain::submitAndPresent(uint32_t imageIndex, VkCommandBuffer cmd,
+                                      VkSemaphore cullSem, uint64_t cullWaitVal) {
     if (isHeadless()) return submitAndPresentOffscreen(imageIndex, cmd);
     if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
         vkWaitForFences(m_ctx.device(), 1, &m_imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX);
     m_imagesInFlight[imageIndex] = m_inFlightFences[m_currentFrame];
 
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // Build wait semaphore list: always imageAvailable (binary), optionally cullSem (timeline)
+    VkSemaphore           waitSems[2]   = { m_imageAvailableSemaphores[m_currentFrame], cullSem };
+    VkPipelineStageFlags  waitStages[2] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT };
+    uint64_t              waitVals[2]   = { 0, cullWaitVal };  // 0 = ignored for binary semaphore
+    uint32_t              waitCount     = (cullSem != VK_NULL_HANDLE) ? 2u : 1u;
+
+    VkTimelineSemaphoreSubmitInfo tssi{};
+    tssi.sType                   = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    tssi.waitSemaphoreValueCount = waitCount;
+    tssi.pWaitSemaphoreValues    = waitVals;
+
     VkSubmitInfo si{};
     si.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.waitSemaphoreCount   = 1;
-    si.pWaitSemaphores      = &m_imageAvailableSemaphores[m_currentFrame];
-    si.pWaitDstStageMask    = &waitStage;
+    si.pNext                = (cullSem != VK_NULL_HANDLE) ? &tssi : nullptr;
+    si.waitSemaphoreCount   = waitCount;
+    si.pWaitSemaphores      = waitSems;
+    si.pWaitDstStageMask    = waitStages;
     si.commandBufferCount   = 1;
     si.pCommandBuffers      = &cmd;
     si.signalSemaphoreCount = 1;

@@ -93,6 +93,10 @@ public:
     void setPBRPipeline(Pipeline* p) { m_pbrPipeline = p; }
     // Set up GPU frustum-culling compute pass (call after loadPBRModel).
     void setupCullPipeline(const std::string& cullSpvPath);
+    // Build BLAS/TLAS and enable ray-traced shadows (call after setupCullPipeline).
+    void buildRTAccelStructures();
+    // Set up mesh shader pipeline + meshlet descriptor sets (call after loadPBRModel).
+    void setupMeshShaderPipeline(Pipeline* p);
     void setOrbitCamera(float azimuth, float elevation, float radius) {
         m_orbitAzimuth = azimuth; m_orbitElevation = elevation; m_orbitRadius = radius;
     }
@@ -170,6 +174,16 @@ private:
     std::vector<std::unique_ptr<Buffer>> m_cullUBOBuffers;     // viewProj + drawCount per frame
     std::vector<std::unique_ptr<Buffer>> m_culledIndirectBufs; // output per frame
 
+    // Async compute: dedicated compute queue dispatch with timeline semaphore
+    VkCommandPool                m_computeCmdPool  = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> m_computeCmdBufs;
+    VkSemaphore                  m_cullTimelineSem = VK_NULL_HANDLE;
+    uint64_t                     m_cullTimelineVal = 0;
+
+    // Mesh shader pipeline (task+mesh+frag replacing vertex+cull when supported)
+    Pipeline* m_meshShaderPipeline = nullptr;
+
+    bool     m_rtEnabled       = false;  // true once TLAS is built and descriptors updated
     uint32_t m_lastImageIndex  = 0;
     uint32_t m_frameCount      = 0;
 };
