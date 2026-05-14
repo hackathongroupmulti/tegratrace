@@ -624,7 +624,7 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
     uint32_t profIdx = frameIdx % Swapchain::kMaxFramesInFlight;
     const bool isPBRScene = (m_scene == 3) && m_pbrModel && m_pbrModel->isLoaded() && m_pbrPipeline;
     if (m_profiler) {
-        if (!isPBRScene) m_profiler->beginPass(cmd, profIdx, "main");
+        m_profiler->beginPass(cmd, profIdx, isPBRScene ? "pbr" : "main");
         m_profiler->beginPipelineStats(cmd, profIdx);
     }
 
@@ -791,6 +791,10 @@ VkCommandBuffer Renderer::recordCommandBuffer(uint32_t imageIndex, uint32_t fram
 
             if (m_frameCallback) m_frameCallback(frameNumber, cmd, stats);
             vkCmdEndRenderPass(cmd);
+            if (m_profiler) {
+                m_profiler->endPass(cmd, profIdx);
+                m_profiler->endPipelineStats(cmd, profIdx);
+            }
             VK_CHECK(vkEndCommandBuffer(cmd));
             return cmd;
         }

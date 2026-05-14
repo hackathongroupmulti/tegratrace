@@ -30,6 +30,7 @@ struct AppConfig {
     bool        saveRef        = false;
     bool        headless       = false;
     bool        multiRes       = false;
+    bool        noRT           = false;
     uint32_t    captureEvery   = 50;
     int         scene          = 0;
     std::string replayPath;
@@ -47,6 +48,7 @@ AppConfig parseArgs(int argc, char** argv) {
         else if (!strcmp(argv[i], "--save-ref"))                     cfg.saveRef        = true;
         else if (!strcmp(argv[i], "--headless"))                     cfg.headless       = true;
         else if (!strcmp(argv[i], "--multi-res"))                    cfg.multiRes       = true;
+        else if (!strcmp(argv[i], "--no-rt"))                        cfg.noRT           = true;
         else if (!strcmp(argv[i], "--capture-every") && i+1 < argc) cfg.captureEvery   = std::stoul(argv[++i]);
         else if (!strcmp(argv[i], "--scene")         && i+1 < argc) cfg.scene           = std::stoi(argv[++i]);
         else if (!strcmp(argv[i], "--replay")        && i+1 < argc) cfg.replayPath       = argv[++i];
@@ -138,7 +140,7 @@ int main(int argc, char** argv) {
             if (!cfg.fbxPath.empty()) {
                 renderer.loadPBRModel(cfg.fbxPath);
                 renderer.setupCullPipeline(path("shaders/cull.comp.spv"));
-                if (ctx.rayQuerySupported())
+                if (ctx.rayQuerySupported() && !cfg.noRT)
                     renderer.buildRTAccelStructures();
                 if (meshShaderPipeline)
                     renderer.setupMeshShaderPipeline(meshShaderPipeline.get());
