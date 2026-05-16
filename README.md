@@ -2,14 +2,16 @@
 
 **Vulkan Graphics Validation and Diagnostics Platform**
 
-A low-level graphics tooling platform built on Vulkan 1.2. TegraTrace renders scenes through a
-configurable GPU pipeline and wraps them in integrated subsystems: frame capture, replay,
-GPU profiling, regression validation, synchronization diagnostics, IBL rendering, GPU-driven
-indirect rendering, and a live debug overlay.
+Solo project, built from scratch in C++17/GLSL. TegraTrace renders scenes through a configurable
+GPU pipeline and wraps them in integrated subsystems: frame capture, replay, GPU profiling,
+regression validation, synchronization diagnostics, IBL rendering, GPU-driven indirect rendering,
+and a live debug overlay.
 
 The renderer is the subject under test — not the project itself. The same pattern used internally
 in driver and graphics tools teams: a controlled rendering harness that can inspect, reproduce,
 and validate its own output.
+
+**Tech stack:** C++17 · GLSL/SPIR-V 1.4 · Vulkan 1.2 · CMake 3.20 · MSVC 2022 · GitHub Actions CI
 
 ---
 
