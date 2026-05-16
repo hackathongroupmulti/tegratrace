@@ -24,28 +24,44 @@ frustum culling, bindless descriptor heap, pipeline cache warm.
 
 | Metric | Value |
 |---|---|
-| Headless FPS (300 frames, warm cache) | **~1505 avg** |
-| CPU frame time avg | **0.66 ms** |
-| CPU frame time p50 | **0.29 ms** |
-| CPU frame time p95 | **2.36 ms** |
-| GPU frame time avg | **0.50 ms** |
-| GPU frame time p50 | **0.22 ms** |
-| GPU frame time p95 | **2.27 ms** |
-| GPU frame time p99 | **4.52 ms** |
-| VS invocations / frame | **~28** (mesh shaders handle all 49 PBR submeshes; VS only serves ImGui overlay) |
-| FS invocations / frame | **~2,652** (795,609 / 300 frames) |
-| Clip invocations / frame | **~833** |
-| Bindless texture slots | **61** (deduplicated from ~160 material references, 49 submeshes) |
-| Spike frames | **0** |
+| FPS (300 frames, warm pipeline cache) | **~1,505 avg** |
+| CPU frame time avg / p50 / p95 | **0.66 ms / 0.29 ms / 2.36 ms** |
+| GPU frame time avg / p50 / p95 / p99 | **0.50 ms / 0.22 ms / 2.27 ms / 4.52 ms** |
+| Spike frames (> p99 × 1.5) | **0** |
+| Draw calls / frame | **49** (one per submesh, GPU-driven indirect) |
 | GPU timestamp resolution | **1 ns/tick** |
 
-### Simple scenes
+**Scene geometry & GPU workload:**
 
 | Metric | Value |
 |---|---|
-| Headless FPS (scene 0 — single cube) | **~18,724 avg** |
-| Headless FPS (scene 1 — 25-cube grid) | **~17,627 avg** |
-| Regression PSNR (deterministic repro) | **100.0 dB** |
+| Submeshes | **49** |
+| Total vertices | **194,242** |
+| Meshlets (task + mesh pipeline) | **3,552** across 49 submeshes |
+| Meshlet vertex refs / triangles | **225,255 vert-refs / 247,573 triangles** |
+| Bindless texture slots | **61** (deduplicated from ~160 material references) |
+| Unique texture uploads | **61** (4K albedo/normal/roughness/metallic/AO per material) |
+| RT acceleration structures | **49 BLASes + 1 TLAS** (one BLAS per submesh, 49 TLAS instances) |
+| VS invocations / frame | **~28** (mesh shader path handles all PBR draws; VS serves ImGui only) |
+| Clip invocations / frame | **~833** |
+| FS invocations / frame | **~2,652** |
+
+### Regression validation — scene 0 (single rotating cube, headless)
+
+100 test frames captured at 1280×720 and compared against saved references.
+Headless mode eliminates the ImGui overlay from the pixel comparison, ensuring
+deterministic output across runs.
+
+| Metric | Value |
+|---|---|
+| Test frames | **100** (frames 5–500, every 5 frames, `--reg-every 5`) |
+| Pass rate | **100%** (100/100) |
+| PSNR | **100.0 dB** (pixel-perfect — 0 failed pixels per frame) |
+| Pixels per frame | **921,600** (1280 × 720) |
+| PSNR pass threshold | **40 dB** (configurable) |
+| Diff heatmaps | **generated for all 100 test frames** |
+| GPU frame time avg / p99 | **0.06 ms / 0.09 ms** (headless, no UI) |
+| FPS (headless) | **~3,281 avg** |
 
 ---
 
@@ -336,8 +352,9 @@ build\Release\tegratrace.exe [options]
 | `--fbx path.fbx` | Load FBX for PBR scene 3 (implies `--scene 3`) |
 | `--capture` | Write per-frame JSON to `captures/` |
 | `--capture-every N` | Capture every Nth frame (default: 50) |
-| `--regression` | Compare frames 100 and 400 against references |
-| `--save-ref` | Save frames 100 and 400 as regression references |
+| `--regression` | Compare captured frames against references |
+| `--save-ref` | Save captured frames as regression references |
+| `--reg-every N` | Regression/save-ref cadence in frames (default: 50) |
 | `--multi-res` | Also test at 50% and 25% scale |
 | `--replay path` | Replay a captured frame JSON |
 | `--no-rt` | Skip BLAS/TLAS build (useful for benchmarking without RT overhead) |

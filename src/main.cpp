@@ -32,6 +32,7 @@ struct AppConfig {
     bool        multiRes       = false;
     bool        noRT           = false;
     uint32_t    captureEvery   = 50;
+    uint32_t    regEvery       = 50;
     int         scene          = 0;
     std::string replayPath;
     std::string meshPath;
@@ -50,6 +51,7 @@ AppConfig parseArgs(int argc, char** argv) {
         else if (!strcmp(argv[i], "--multi-res"))                    cfg.multiRes       = true;
         else if (!strcmp(argv[i], "--no-rt"))                        cfg.noRT           = true;
         else if (!strcmp(argv[i], "--capture-every") && i+1 < argc) cfg.captureEvery   = std::stoul(argv[++i]);
+        else if (!strcmp(argv[i], "--reg-every")     && i+1 < argc) cfg.regEvery        = std::stoul(argv[++i]);
         else if (!strcmp(argv[i], "--scene")         && i+1 < argc) cfg.scene           = std::stoi(argv[++i]);
         else if (!strcmp(argv[i], "--replay")        && i+1 < argc) cfg.replayPath       = argv[++i];
         else if (!strcmp(argv[i], "--mesh")          && i+1 < argc) cfg.meshPath         = argv[++i];
@@ -377,7 +379,7 @@ int main(int argc, char** argv) {
                         pendingReplay.clear();
                     }
 
-                    if (cfg.regression && (renderedFrame == 100 || renderedFrame == 400)) {
+                    if (cfg.regression && renderedFrame > 0 && renderedFrame % cfg.regEvery == 0) {
                         renderer.waitIdle();
                         std::string testName = "frame_" + std::to_string(renderedFrame);
                         if (cfg.saveRef) {
